@@ -5,8 +5,11 @@ Qwiic button -> NeoPixel pulse + receipt print.
 On button press: pulses a 38-LED NeoPixel strip on GPIO12 three times,
 then prints testReceipt_01_80mm.png on a USB thermal receipt printer.
 
-Dependencies (install with pip3):
-    sudo pip3 install rpi_ws281x sparkfun-qwiic-button python-escpos --break-system-packages
+Dependencies (install with pip3). Note the [usb] extra on python-escpos -
+without it, pyusb isn't installed and USB printing fails with
+"requires a usb library to be installed". Must be installed for root too
+(sudo's Python uses root's own site-packages, separate from your user's):
+    sudo pip3 install rpi_ws281x sparkfun-qwiic-button "python-escpos[usb]" --break-system-packages
 
 NeoPixels on GPIO12 use the Pi's PWM0 hardware channel and DMA, so this
 script must be run as root (sudo python3 button_neopixel_printer.py).
@@ -44,7 +47,15 @@ PULSE_STEP_DELAY = 0.008  # seconds between brightness steps; lower = faster pul
 
 # Qwiic button (default I2C address is 0x6F on SparkFun Qwiic buttons)
 BUTTON_I2C_ADDRESS = 0x6F
-DEBOUNCE_MS = 50
+DEBOUNCE_MS = 150          # hardware debounce, passed to the button itself
+
+# Software debounce/backstop. The mechanical switch can bounce for a few ms
+# on both press and release; a few noisy is_pressed() reads right after a
+# real press can otherwise look like several extra presses.
+STABLE_READS_REQUIRED = 4   # consecutive "pressed" reads needed to confirm a real press
+STABLE_READ_INTERVAL = 0.01  # seconds between confirmation reads (~40ms total)
+REFRACTORY_SECONDS = 1.0    # ignore the button entirely for this long after a trigger,
+                            # which swallows any release-bounce train
 
 # Printer (USB thermal, ESC/POS). Default: "bt_large" (80mm), per escpos_test.py.
 PRINTER_VENDOR_ID = 0x0483
@@ -129,6 +140,23 @@ def on_button_pressed():
     print_receipt()
 
 
+def wait_for_stable_press():
+    """Block until is_button_pressed() reads True for STABLE_READS_REQUIRED
+    consecutive polls in a row, to filter out contact bounce on press."""
+    while True:
+        if button.is_button_pressed():
+            consecutive = 1
+            for _ in range(STABLE_READS_REQUIRED - 1):
+                time.sleep(STABLE_READ_INTERVAL)
+                if button.is_button_pressed():
+                    consecutive += 1
+                else:
+                    break
+            if consecutive >= STABLE_READS_REQUIRED:
+                return
+        time.sleep(0.02)
+
+
 def cleanup(*_args):
     clear_strip()
     sys.exit(0)
@@ -143,13 +171,20 @@ def main():
     print("Ready. Waiting for button press (Ctrl+C to quit)...")
 
     while True:
-        if button.is_button_pressed():
-            on_button_pressed()
-            # Wait for release so one press = one trigger.
-            while button.is_button_pressed():
-                time.sleep(0.02)
-            button.clear_event_bits()
-        time.sleep(0.02)
+        wait_for_stable_press()
+        on_button_pressed()
+        button.clear_event_bits()
+
+        # Hard-ignore the switch for a bit: this is what actually kills the
+        # "3-4 fake presses after a real one" - it swallows the release-bounce
+        # train instead of racing it with the outer loop.
+        time.sleep(REFRACTORY_SECONDS)
+
+        # Now wait for a clean release (in case the button is somehow still
+        # down or still settling) before re-arming for the next press.
+        while button.is_button_pressed():
+            time.sleep(0.02)
+        button.clear_event_bits()
 
 
 if __name__ == "__main__":
