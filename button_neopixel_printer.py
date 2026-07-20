@@ -20,6 +20,7 @@ printer as non-root, add a udev rule granting your user access, or just
 run this whole script with sudo (needed anyway for the LEDs).
 """
 
+import argparse
 import os
 import signal
 import sys
@@ -134,10 +135,10 @@ def print_receipt(image_path=RECEIPT_IMAGE_PATH):
         print(f"Print failed: {exc}", file=sys.stderr)
 
 
-def on_button_pressed():
+def on_button_pressed(image_path=RECEIPT_IMAGE_PATH):
     print("Button pressed - pulsing LEDs and printing receipt.")
     pulse()
-    print_receipt()
+    print_receipt(image_path)
 
 
 def wait_for_stable_press():
@@ -162,17 +163,31 @@ def cleanup(*_args):
     sys.exit(0)
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--image",
+        dest="image_path",
+        default=RECEIPT_IMAGE_PATH,
+        help="Path to the receipt image to print on button press "
+             f"(default: {RECEIPT_IMAGE_PATH})",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
 
     init_button()
     clear_strip()
-    print("Ready. Waiting for button press (Ctrl+C to quit)...")
+    print(f"Ready. Will print '{args.image_path}' on button press (Ctrl+C to quit)...")
 
     while True:
         wait_for_stable_press()
-        on_button_pressed()
+        on_button_pressed(args.image_path)
         button.clear_event_bits()
 
         # Hard-ignore the switch for a bit: this is what actually kills the
