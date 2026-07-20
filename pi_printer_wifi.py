@@ -56,18 +56,22 @@ def monitor_and_print():
                         p = Usb(VENDOR_ID, PRODUCT_ID)
                     else:
                         p = Serial(BT_PORT, baudrate=9600)
-                    
-                    print("Printing dithered receipt raster...")
-                    # Automatically scales and prints the image onto the 58mm paper roll perfectly
-                    p.image(image_obj, impl="bitImageColumn")
-                    
-                    # Feed and cut paper
-                    print("Feeding and slicing paper...")
-                    p.text("\n\n\n\n")
-                    p.cut()
-                    
-                    print("[-] Print job completed successfully!")
-                    last_printed_timestamp = job_timestamp
+
+                    try:
+                        print("Printing dithered receipt raster...")
+                        # Automatically scales and prints the image onto the 58mm paper roll perfectly
+                        p.image(image_obj, impl="bitImageColumn")
+
+                        # Feed and cut paper
+                        print("Feeding and slicing paper...")
+                        p.text("\n\n\n\n")
+                        p.cut()
+
+                        print("[-] Print job completed successfully!")
+                        last_printed_timestamp = job_timestamp
+                    finally:
+                        # Release the USB/serial handle so the next job can reconnect
+                        p.close()
                     
         except requests.exceptions.RequestException:
             # Silently tolerate laptop/network offline state and retry
