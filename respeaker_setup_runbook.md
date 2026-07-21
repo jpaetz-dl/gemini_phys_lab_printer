@@ -166,6 +166,67 @@ instead.
 Note this doesn't remove the need for `sudo` on `button_neopixel_printer.py`
 — that script still needs root for the NeoPixel GPIO/PWM access regardless.
 
+## 10. Run `button_neopixel_printer.py` on boot (systemd)
+
+The main script needs to run as root (GPIO12 PWM/DMA) and should come back
+up automatically after a power cycle or crash, so use a systemd service
+rather than a cron `@reboot` line or autostart script.
+
+### Create the unit file
+
+```bash
+sudo nano /etc/systemd/system/button-printer.service
+```
+
+```ini
+[Unit]
+Description=Qwiic button / NeoPixel / receipt printer
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/gemini_phys_lab_printer
+ExecStart=/usr/bin/python3 /home/pi/gemini_phys_lab_printer/button_neopixel_printer.py
+Restart=on-failure
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Adjust `WorkingDirectory`/`ExecStart` to wherever the repo actually lives on
+that Pi.
+
+### Enable and start it
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable button-printer.service   # starts automatically on future boots
+sudo systemctl start button-printer.service    # starts it right now, without rebooting
+```
+
+### Check on it / make changes
+
+```bash
+sudo systemctl status button-printer.service   # is it running?
+journalctl -u button-printer.service -f        # live console output (prints, errors, timing)
+
+sudo systemctl restart button-printer.service  # after editing the .py file
+sudo systemctl stop button-printer.service      # to stop it (e.g. for manual testing)
+sudo systemctl disable button-printer.service   # stop it from running at boot
+```
+
+### Gotchas
+
+- **`Restart=on-failure` matters:** at boot, I2C/USB devices may not be
+  enumerated the instant the service starts. If `init_button()` fails once,
+  systemd just retries a few seconds later instead of leaving it dead.
+- **Ctrl+C doesn't apply here:** since it's running under systemd as root,
+  not in your terminal, use `sudo systemctl stop button-printer.service`
+  to stop it instead.
+
 ---
 
 ### Notes for replicating on other devices

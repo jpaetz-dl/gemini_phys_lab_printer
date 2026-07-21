@@ -79,7 +79,7 @@ LED_MAX_BRIGHTNESS = 255
 IDLE_COLOR = Color(15, 15, 15)     # soft, dim white - steady-state / resting color
 PULSE_COLOR = Color(255, 255, 255)  # same white, pulsed brighter, while working
 PULSE_COUNT = 3            # fallback pulse count when pulse() is run without a stop_event
-PULSE_STEP_DELAY = 0.008  # seconds between brightness steps; lower = faster pulse
+PULSE_STEP_DELAY = 0.02   # seconds between brightness steps; lower = faster pulse
 
 # Qwiic button (default I2C address is 0x6F on SparkFun Qwiic buttons)
 BUTTON_I2C_ADDRESS = 0x6F
@@ -160,21 +160,29 @@ def set_all(color):
     strip.show()
 
 
-def scale_color(color, brightness_0_to_1):
+def _color_channels(color):
     # Color is packed as 0xWWRRGGBB-ish int from rpi_ws281x; pull channels back out.
     white = (color >> 24) & 0xFF
     red = (color >> 16) & 0xFF
     green = (color >> 8) & 0xFF
     blue = color & 0xFF
+    return red, green, blue, white
+
+
+def lerp_color(color_a, color_b, t):
+    """Blend between two Colors: t=0 -> color_a, t=1 -> color_b."""
+    r1, g1, b1, _ = _color_channels(color_a)
+    r2, g2, b2, _ = _color_channels(color_b)
     return Color(
-        int(red * brightness_0_to_1),
-        int(green * brightness_0_to_1),
-        int(blue * brightness_0_to_1),
+        int(r1 + (r2 - r1) * t),
+        int(g1 + (g2 - g1) * t),
+        int(b1 + (b2 - b1) * t),
     )
 
 
-def pulse(color=PULSE_COLOR, stop_event=None, times=PULSE_COUNT):
-    """Fade the whole strip up and down.
+def pulse(color=PULSE_COLOR, base_color=IDLE_COLOR, stop_event=None, times=PULSE_COUNT):
+    """Breathe the whole strip between `base_color` (the dim idle color) and
+    `color` (full brightness) - it never goes fully dark.
 
     If `stop_event` is given, pulses repeatedly until it's set (this is the
     "working" animation that runs from button release until the receipt
@@ -184,11 +192,11 @@ def pulse(color=PULSE_COLOR, stop_event=None, times=PULSE_COUNT):
     steps = 50
 
     def one_cycle():
-        for step in range(steps + 1):          # fade in
-            set_all(scale_color(color, step / steps))
+        for step in range(steps + 1):          # fade up to full brightness
+            set_all(lerp_color(base_color, color, step / steps))
             time.sleep(PULSE_STEP_DELAY)
-        for step in range(steps, -1, -1):      # fade out
-            set_all(scale_color(color, step / steps))
+        for step in range(steps, -1, -1):      # fade back down to the base color
+            set_all(lerp_color(base_color, color, step / steps))
             time.sleep(PULSE_STEP_DELAY)
 
     if stop_event is not None:
