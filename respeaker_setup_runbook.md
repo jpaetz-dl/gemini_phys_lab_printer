@@ -196,8 +196,18 @@ User=root
 WantedBy=multi-user.target
 ```
 
-Adjust `WorkingDirectory`/`ExecStart` to wherever the repo actually lives on
-that Pi.
+`/home/pi/gemini_phys_lab_printer` above is a placeholder — the actual
+username varies per device (e.g. `printbot2`), so swap in the real path
+both places. **`ExecStart` must include the script filename, not just the
+folder** — pointing it at the directory alone (`.../gemini_phys_lab_printer`
+with no `/button_neopixel_printer.py` on the end) fails at every boot with:
+
+```
+python3: can't find '__main__' module in '/home/printbot2/gemini_phys_lab_printer'
+```
+
+because Python treats a bare directory argument as a package to run via
+`__main__.py`, which doesn't exist here.
 
 ### Enable and start it
 

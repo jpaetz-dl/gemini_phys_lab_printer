@@ -41,6 +41,11 @@ VENDOR_ID = 0x0483    # From `lsusb` on the Pi
 PRODUCT_ID = 0x5743
 BT_PORT = "/dev/rfcomm0"  # only used if USE_USB is False
 
+# Rotate the receipt image 180 degrees before printing. Flip this if the
+# printed receipt comes out upside-down (depends on how the paper roll is
+# loaded / which way the printer feeds).
+FLIP_180 = True
+
 
 def extract_image(resp):
     """Pull a PIL Image out of the API response.
@@ -79,6 +84,8 @@ def extract_image(resp):
 
 def print_image(image_obj):
     """Print a PIL image on the thermal printer (same process as pi_printer_wifi.py)."""
+    if FLIP_180:
+        image_obj = image_obj.transpose(Image.ROTATE_180)
     print(image_obj.size)
     print("Connecting to ETprin M860 Thermal Printer...")
     if USE_USB:
