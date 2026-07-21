@@ -77,6 +77,95 @@ aplay -D plughw:CARD=UACDemoV10,DEV=0 respeaker_test.wav
 
 Confirms mic recording quality using the speaker already verified in step 2.
 
+## 8. Install dependencies for the button / NeoPixel / printer scripts
+
+These cover `button_neopixel_printer.py`, `audio_io.py`, `reflect_and_print.py`,
+`pi_printer_wifi.py`, and `escpos_test.py`.
+
+### System packages (apt)
+
+```bash
+sudo apt update
+sudo apt install -y ffmpeg libusb-1.0-0 i2c-tools
+```
+
+- `ffmpeg` — used by `audio_io.py` to record straight to WebM/Opus or M4A/AAC.
+- `libusb-1.0-0` — backend `pyusb` needs to talk to the USB thermal printer.
+- `i2c-tools` — optional, but `i2cdetect -y 1` is the fastest way to confirm the
+  Qwiic button is wired correctly (look for it at address `0x6f`).
+
+### Enable I2C (needed for the Qwiic button)
+
+```bash
+sudo raspi-config nonint do_i2c 0
+sudo reboot
+```
+
+Or via the UI: `raspi-config` → *Interface Options* → *I2C* → enable.
+
+### Python packages (pip)
+
+The GPIO/PWM (NeoPixel) and printer scripts need to run as root, and `sudo`
+uses root's own site-packages — separate from your user's — so install these
+**with sudo** too, or they'll appear "missing" the moment you run the script
+with `sudo python3 ...` even though `pip3 list` shows them for your user:
+
+```bash
+sudo pip3 install rpi_ws281x sparkfun-qwiic-button pillow requests \
+    "python-escpos[usb]" --break-system-packages
+```
+
+- `rpi_ws281x` — drives the NeoPixel strip on GPIO12 (PWM0/DMA).
+- `sparkfun-qwiic-button` — the `qwiic_button` module for the SparkFun Qwiic button.
+- `pillow` — image handling for the receipts (`PIL.Image`).
+- `requests` — POSTing audio to the receipt-generation API.
+- `python-escpos[usb]` — **the `[usb]` extra matters.** Plain `python-escpos`
+  doesn't pull in `pyusb`, and printing then fails with "Printing with USB
+  connection requires a usb library to be installed" even though escpos itself
+  imported fine.
+
+### Gotchas
+
+- **Must run as root:** `sudo python3 button_neopixel_printer.py` — required
+  for the NeoPixel PWM/DMA access; the printer and I2C button also end up
+  needing root in the same process.
+- **`[usb]` extra + sudo, together:** the USB printing error above almost
+  always means one of these two was skipped, not that pyusb/libusb are
+  actually absent from the system.
+- **Onboard audio vs. GPIO12/18:** the Pi's onboard analog audio jack uses the
+  same PWM peripheral as GPIO12/18. Since this setup uses a USB speaker
+  (`UACDemoV10`, see step 1), this hasn't been an issue — but if a future Pi
+  drives audio through the 3.5mm jack instead, add `dtparam=audio=off` to
+  `config.txt` before wiring NeoPixels to GPIO12.
+
+## 9. USB permissions for the thermal printer (udev rule)
+
+On a fresh Pi, printing without `sudo` fails with something like:
+
+```
+escpos.exceptions.DeviceNotFoundError: Device not found (Unable to open USB printer on (1155, 22339):
+[Errno 13] Access denied (insufficient permissions))
+```
+
+`(1155, 22339)` is just `(0x0483, 0x5743)` in decimal — the bt_large
+printer's vendor/product ID. By default only root can open USB devices, so
+either run the print scripts with `sudo`, or add a one-time udev rule so your
+regular user can too:
+
+```bash
+echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="5743", MODE="0666"' | sudo tee /etc/udev/rules.d/99-thermal-printer.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+Then unplug and replug the printer's USB cable (or reboot) so the rule takes
+effect. If you're using a different printer profile (`bt_small`, `rongta`,
+or raw IDs), swap in that printer's `idVendor`/`idProduct` from `lsusb`
+instead.
+
+Note this doesn't remove the need for `sudo` on `button_neopixel_printer.py`
+— that script still needs root for the NeoPixel GPIO/PWM access regardless.
+
 ---
 
 ### Notes for replicating on other devices

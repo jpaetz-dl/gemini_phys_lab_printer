@@ -20,6 +20,7 @@ now it also runs standalone as a CLI for testing.
 """
 
 import argparse
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -95,49 +96,73 @@ def record_webm(output_path, duration=10, device=RESPEAKER_DEVICE,
     return output_path
 
 
-def start_recording_m4a(output_path, device=RESPEAKER_DEVICE, rate=SAMPLE_RATE, channels=CHANNELS):
-    """Start an open-ended recording from `device` directly to an AAC/M4A file via ffmpeg.
+class HoldRecording:
+    """Handle for an open-ended recording started by start_recording_m4a().
+    Opaque to callers -- just pass it to stop_recording()."""
 
-    Unlike record_audio()/record_webm(), this doesn't take a duration -- it's meant
-    for press-and-hold style capture where the caller doesn't know how long the
-    recording should be until the button is released. Returns the running Popen;
-    stop it with stop_recording() once the hold ends.
+    def __init__(self, proc, tmp_wav_path, output_path):
+        self.proc = proc
+        self.tmp_wav_path = tmp_wav_path
+        self.output_path = output_path
 
-    Requires ffmpeg to be installed (`sudo apt install ffmpeg`).
+
+def start_recording_m4a(output_path, device=RESPEAKER_DEVICE, rate=SAMPLE_RATE,
+                         channels=CHANNELS, fmt=SAMPLE_FORMAT):
+    """Start an open-ended recording from `device`, for press-and-hold style
+    capture where the caller doesn't know how long the recording should be
+    until the button is released.
+
+    Captures via `arecord` to a temporary WAV file -- the same tool/settings
+    confirmed to give clean audio in respeaker_setup_runbook.md -- rather than
+    ffmpeg's live ALSA input, which was found to produce static on the
+    ReSpeaker 2-Mics HAT (likely a buffering/format-negotiation quirk specific
+    to ffmpeg's alsa demuxer on this hardware). The WAV is transcoded to
+    AAC/M4A afterward, as a separate file-to-file ffmpeg pass, once
+    stop_recording() is called -- that step isn't real-time-sensitive, so it
+    isn't subject to the same issue.
+
+    Returns a HoldRecording handle; pass it to stop_recording().
     """
     output_path = Path(output_path)
+    tmp_wav_path = output_path.with_name(output_path.stem + ".tmp.wav")
     cmd = [
-        "ffmpeg", "-y",
-        "-f", "alsa",
-        "-ar", str(rate),
-        "-ac", str(channels),
-        "-i", device,
-        "-c:a", "aac",
-        "-b:a", "128k",
-        str(output_path),
+        "arecord",
+        "-D", device,
+        "-c", str(channels),
+        "-r", str(rate),
+        "-f", fmt,
+        str(tmp_wav_path),
     ]
-    print(f"Recording from {device} -> {output_path} (m4a/aac, until stopped)")
-    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"Recording from {device} -> {tmp_wav_path} (wav, until stopped)")
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return HoldRecording(proc, tmp_wav_path, output_path)
 
 
-def stop_recording(proc, timeout=10):
-    """Gracefully stop a recording started by start_recording_m4a() (or any open-ended
-    ffmpeg Popen without a fixed -t duration).
+def stop_recording(recording, timeout=10):
+    """Stop a recording started by start_recording_m4a(), then transcode the
+    captured WAV to the AAC/M4A path that was requested at start time.
 
-    Sends SIGINT (same as Ctrl+C) rather than killing the process, so ffmpeg finalizes
-    the output container's moov atom properly instead of leaving a truncated/corrupt file.
+    Sends SIGINT (same as Ctrl+C) rather than killing arecord, so it finalizes
+    the WAV header properly instead of leaving a truncated/corrupt file.
     """
-    import signal
+    proc = recording.proc
+    if proc.poll() is None:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
-    if proc.poll() is not None:
-        return  # already exited
-    proc.send_signal(signal.SIGINT)
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-    print("Recording stopped.")
+    tmp_wav_path = recording.tmp_wav_path
+    output_path = recording.output_path
+    print(f"Recording stopped. Encoding {tmp_wav_path} -> {output_path} ...")
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(tmp_wav_path), "-c:a", "aac", "-b:a", "128k", str(output_path)],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    tmp_wav_path.unlink(missing_ok=True)
+    print(f"Saved {output_path}")
 
 
 def upload_audio(path, url=DEFAULT_API_URL, field_name="audio", content_type="audio/webm", params=None):
