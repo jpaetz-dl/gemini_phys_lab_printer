@@ -74,6 +74,36 @@ def record_and_playback(output_path, duration=5, in_device=RESPEAKER_DEVICE,
     return path
 
 
+def start_looping_playback(path, device=SPEAKER_DEVICE):
+    """Start looping playback of an audio file (mp3, wav, etc.) through `device`,
+    repeating indefinitely until stop_playback() is called. Uses ffmpeg rather
+    than aplay since aplay can't decode compressed formats like mp3.
+
+    Requires ffmpeg to be installed (`sudo apt install ffmpeg`).
+    """
+    path = Path(path)
+    cmd = [
+        "ffmpeg", "-y",
+        "-stream_loop", "-1",
+        "-i", str(path),
+        "-f", "alsa", device,
+    ]
+    print(f"Looping playback: {path} -> {device}")
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def stop_playback(proc, timeout=5):
+    """Stop playback started by start_looping_playback()."""
+    if proc.poll() is not None:
+        return  # already exited
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
 def record_webm(output_path, duration=10, device=RESPEAKER_DEVICE,
                  rate=SAMPLE_RATE, channels=CHANNELS):
     """Record `duration` seconds from `device` directly to a WebM/Opus file via ffmpeg.

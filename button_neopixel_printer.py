@@ -9,14 +9,17 @@ Press and hold the button while talking:
 
 Release the button:
   - the button LED turns off
-  - the 38-LED NeoPixel strip on GPIO12 starts its pulse animation
+  - the 38-LED NeoPixel strip on GPIO12 starts pulsing a soft white (its
+    steady-state color is a dim, resting version of the same white) and the
+    Jeopardy! "Think Music" theme loops on the USB speaker
   - concurrently, the recording is POSTed to the receipt-generation API
     (equivalent to:
        curl -X POST -F "audio=@recording.m4a;type=audio/mp4" \
          "https://daily-printer-129172578078.us-central1.run.app/api/generate-receipt?style=computationalHalftone" \
          --output receipt.jpeg
     )
-  - the JPEG the API returns is printed on the USB thermal receipt printer
+  - once the JPEG comes back, the pulsing and music stop (back to the dim
+    steady state) right as it's sent to the USB thermal receipt printer
 
 Reuses audio_io.py (mic recording/upload) and reflect_and_print.py (response
 image extraction + printing) so all three scripts share one implementation.
@@ -52,8 +55,11 @@ from audio_io import (
     RESPEAKER_DEVICE,
     SAMPLE_RATE,
     CHANNELS,
+    SPEAKER_DEVICE,
     start_recording_m4a,
     stop_recording,
+    start_looping_playback,
+    stop_playback,
     upload_audio,
 )
 from reflect_and_print import extract_image, print_image
@@ -70,8 +76,9 @@ LED_DMA = 10            # DMA channel to use for generating signal
 LED_INVERT = False      # True to invert the signal (level shifter)
 LED_CHANNEL = 0         # PWM channel 0 for GPIO12/18
 LED_MAX_BRIGHTNESS = 255
-PULSE_COLOR = Color(0, 128, 255)  # color used while pulsing (G, R, B order for ws281x)
-PULSE_COUNT = 3
+IDLE_COLOR = Color(15, 15, 15)     # soft, dim white - steady-state / resting color
+PULSE_COLOR = Color(255, 255, 255)  # same white, pulsed brighter, while working
+PULSE_COUNT = 3            # fallback pulse count when pulse() is run without a stop_event
 PULSE_STEP_DELAY = 0.008  # seconds between brightness steps; lower = faster pulse
 
 # Qwiic button (default I2C address is 0x6F on SparkFun Qwiic buttons)
@@ -97,6 +104,13 @@ RECEIPT_IMAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 AUDIO_OUTPUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "recording.m4a")
 
+# "Working" music - loops on the USB speaker while the strip pulses, i.e.
+# from button release until the receipt starts printing.
+JEOPARDY_CLIP_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "01 - Theme from _Jeopardy!_ (Think Music) (From _Jeopardy!_).mp3",
+)
+
 # Receipt-generation API (separate from the escpos printer)
 RECEIPT_API_URL = "https://daily-printer-129172578078.us-central1.run.app/api/generate-receipt"
 RECEIPT_API_STYLE = "computationalHalftone"
@@ -113,9 +127,10 @@ strip.begin()
 
 button = qwiic_button.QwiicButton(address=BUTTON_I2C_ADDRESS)
 
-# Tracks an in-progress recording so cleanup() can stop it if the script is
-# interrupted mid-hold.
+# Tracks an in-progress recording/playback so cleanup() can stop them if the
+# script is interrupted mid-hold or mid-"working" animation.
 _active_recording_proc = None
+_active_playback_proc = None
 
 
 def init_button():
@@ -132,6 +147,11 @@ def clear_strip():
     for i in range(strip.numPixels()):
         strip.setPixelColor(i, Color(0, 0, 0))
     strip.show()
+
+
+def set_idle():
+    """Soft, dim white - the strip's steady/resting state."""
+    set_all(IDLE_COLOR)
 
 
 def set_all(color):
@@ -153,17 +173,32 @@ def scale_color(color, brightness_0_to_1):
     )
 
 
-def pulse(times=PULSE_COUNT, color=PULSE_COLOR):
-    """Fade the whole strip up and down `times` times."""
+def pulse(color=PULSE_COLOR, stop_event=None, times=PULSE_COUNT):
+    """Fade the whole strip up and down.
+
+    If `stop_event` is given, pulses repeatedly until it's set (this is the
+    "working" animation that runs from button release until the receipt
+    starts printing). Otherwise pulses a fixed `times` and stops. Either way,
+    leaves the strip at the dim white idle/steady state when done.
+    """
     steps = 50
-    for _ in range(times):
+
+    def one_cycle():
         for step in range(steps + 1):          # fade in
             set_all(scale_color(color, step / steps))
             time.sleep(PULSE_STEP_DELAY)
         for step in range(steps, -1, -1):      # fade out
             set_all(scale_color(color, step / steps))
             time.sleep(PULSE_STEP_DELAY)
-    clear_strip()
+
+    if stop_event is not None:
+        while not stop_event.is_set():
+            one_cycle()
+    else:
+        for _ in range(times):
+            one_cycle()
+
+    set_idle()
 
 
 def print_receipt(image_path=RECEIPT_IMAGE_PATH):
@@ -211,20 +246,35 @@ def on_button_down(audio_path):
 
 
 def on_button_up(audio_path, api_url, api_style, receipt_output):
-    """Button just released: stop recording, pulse the strip, send the
-    audio off, and print whatever receipt comes back."""
+    """Button just released: stop recording, pulse the strip + loop the
+    "working" music, send the audio off, and print whatever receipt comes
+    back - stopping the pulse/music right as printing starts."""
     print("Button released - stopping recording, pulsing LEDs, and generating receipt.")
     button.LED_off()
+
+    # Start the pulse animation and the Jeopardy loop immediately, so there's
+    # instant feedback on release. Both run until stop_working_feedback() is
+    # called, right before the receipt is sent to the printer.
+    stop_pulse_event = threading.Event()
+    pulse_thread = threading.Thread(target=pulse, kwargs={"stop_event": stop_pulse_event}, daemon=True)
+    pulse_thread.start()
+
+    global _active_playback_proc
+    _active_playback_proc = start_looping_playback(JEOPARDY_CLIP_PATH, device=SPEAKER_DEVICE)
+
+    def stop_working_feedback():
+        global _active_playback_proc
+        stop_pulse_event.set()
+        if _active_playback_proc is not None:
+            stop_playback(_active_playback_proc)
+            _active_playback_proc = None
 
     global _active_recording_proc
     proc, _active_recording_proc = _active_recording_proc, None
     if proc is not None:
-        stop_recording(proc)
+        stop_recording(proc)  # includes the (fast, but blocking) AAC transcode
 
-    # Start the pulse animation and the upload/print sequence at the same time.
-    pulse_thread = threading.Thread(target=pulse, daemon=True)
-    pulse_thread.start()
-
+    request_started = time.monotonic()
     try:
         resp = upload_audio(
             audio_path,
@@ -232,23 +282,31 @@ def on_button_up(audio_path, api_url, api_style, receipt_output):
             content_type="audio/mp4",
             params={"style": api_style} if api_style else None,
         )
+        print(f"Receipt API responded in {time.monotonic() - request_started:.2f}s")
         image_obj = extract_image(resp)
         try:
             image_obj.convert("RGB").save(receipt_output, "JPEG")
         except Exception as exc:
             print(f"Couldn't save a local copy of the receipt: {exc}", file=sys.stderr)
+
+        stop_working_feedback()  # paper's about to start printing
         print_image(image_obj)
     except Exception as exc:
-        print(f"Receipt generation/print failed: {exc}", file=sys.stderr)
+        stop_working_feedback()  # give up cleanly either way
+        print(f"Receipt API request failed after {time.monotonic() - request_started:.2f}s: {exc}",
+              file=sys.stderr)
 
     pulse_thread.join()
 
 
 def cleanup(*_args):
-    global _active_recording_proc
+    global _active_recording_proc, _active_playback_proc
     if _active_recording_proc is not None:
         stop_recording(_active_recording_proc)
         _active_recording_proc = None
+    if _active_playback_proc is not None:
+        stop_playback(_active_playback_proc)
+        _active_playback_proc = None
     try:
         button.LED_off()
     except Exception:
@@ -295,7 +353,7 @@ def main():
     signal.signal(signal.SIGTERM, cleanup)
 
     init_button()
-    clear_strip()
+    set_idle()
     print("Ready. Press and hold the button to record, release to send + print "
           "(Ctrl+C to quit)...")
 
