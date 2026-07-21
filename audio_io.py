@@ -95,10 +95,55 @@ def record_webm(output_path, duration=10, device=RESPEAKER_DEVICE,
     return output_path
 
 
-def upload_audio(path, url=DEFAULT_API_URL, field_name="audio", content_type="audio/webm"):
-    """POST an audio file as multipart/form-data. Equivalent to:
+def start_recording_m4a(output_path, device=RESPEAKER_DEVICE, rate=SAMPLE_RATE, channels=CHANNELS):
+    """Start an open-ended recording from `device` directly to an AAC/M4A file via ffmpeg.
 
-        curl -X POST <url> -F "audio=@<path>;type=audio/webm"
+    Unlike record_audio()/record_webm(), this doesn't take a duration -- it's meant
+    for press-and-hold style capture where the caller doesn't know how long the
+    recording should be until the button is released. Returns the running Popen;
+    stop it with stop_recording() once the hold ends.
+
+    Requires ffmpeg to be installed (`sudo apt install ffmpeg`).
+    """
+    output_path = Path(output_path)
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "alsa",
+        "-ar", str(rate),
+        "-ac", str(channels),
+        "-i", device,
+        "-c:a", "aac",
+        "-b:a", "128k",
+        str(output_path),
+    ]
+    print(f"Recording from {device} -> {output_path} (m4a/aac, until stopped)")
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def stop_recording(proc, timeout=10):
+    """Gracefully stop a recording started by start_recording_m4a() (or any open-ended
+    ffmpeg Popen without a fixed -t duration).
+
+    Sends SIGINT (same as Ctrl+C) rather than killing the process, so ffmpeg finalizes
+    the output container's moov atom properly instead of leaving a truncated/corrupt file.
+    """
+    import signal
+
+    if proc.poll() is not None:
+        return  # already exited
+    proc.send_signal(signal.SIGINT)
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    print("Recording stopped.")
+
+
+def upload_audio(path, url=DEFAULT_API_URL, field_name="audio", content_type="audio/webm", params=None):
+    """POST an audio file as multipart/form-data, optionally with query params. Equivalent to:
+
+        curl -X POST "<url>?<query>" -F "audio=@<path>;type=<content_type>"
 
     Requires the `requests` package (`pip install requests --break-system-packages`).
     """
@@ -107,8 +152,8 @@ def upload_audio(path, url=DEFAULT_API_URL, field_name="audio", content_type="au
     path = Path(path)
     with open(path, "rb") as f:
         files = {field_name: (path.name, f, content_type)}
-        print(f"POSTing {path} -> {url}")
-        resp = requests.post(url, files=files)
+        print(f"POSTing {path} -> {url} (params={params})")
+        resp = requests.post(url, params=params, files=files)
     resp.raise_for_status()
     return resp
 
