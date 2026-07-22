@@ -99,6 +99,13 @@ POT_ADC_CHANNEL = 2     # A2
 ADC_VCC = 3.3  # supply voltage feeding the button pull-up / pot, for thresholds
 BUTTON_PRESSED_VOLTAGE_THRESHOLD = ADC_VCC / 2  # below this = pressed (pulled toward GND)
 
+# I2C on a breadboard/jumper-wire setup can glitch transiently (a nudged wire,
+# noise) and raise OSError ("Input/output error") from the underlying smbus
+# call. Retry a couple times before giving up rather than crashing the whole
+# script or killing the pot-monitor thread over a one-off blip.
+ADC_READ_RETRIES = 3
+ADC_READ_RETRY_DELAY = 0.05  # seconds between retries
+
 # Potentiometer - just monitored/printed for now. Eventually: boost NeoPixel
 # brightness once the pot is turned past this fraction (not wired up yet).
 POT_BRIGHTNESS_THRESHOLD_FRACTION = 0.75
@@ -160,10 +167,25 @@ _active_playback_proc = None
 _pot_stop_event = threading.Event()
 
 
+def read_voltage(channel, retries=ADC_READ_RETRIES, retry_delay=ADC_READ_RETRY_DELAY):
+    """Read an AnalogIn channel's voltage, retrying briefly on OSError (loose
+    wire, I2C noise) instead of letting one bad read take down a thread or
+    the whole script."""
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return channel.voltage
+        except OSError as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(retry_delay)
+    raise last_exc
+
+
 def init_adc():
     try:
-        button_channel.voltage
-        pot_channel.voltage
+        read_voltage(button_channel)
+        read_voltage(pot_channel)
     except OSError as exc:
         sys.exit(f"ADS1015 not found on I2C bus (address {hex(ADS1015_I2C_ADDRESS)}) "
                   f"- check wiring/address: {exc}")
@@ -172,12 +194,12 @@ def init_adc():
 def is_button_pressed():
     """True if the button is pressed - the pull-up reads near ADC_VCC when
     open, and gets pulled down toward 0V when the button is held."""
-    return button_channel.voltage < BUTTON_PRESSED_VOLTAGE_THRESHOLD
+    return read_voltage(button_channel) < BUTTON_PRESSED_VOLTAGE_THRESHOLD
 
 
 def read_pot_fraction():
     """Potentiometer position as a 0.0-1.0 fraction of ADC_VCC."""
-    return max(0.0, min(1.0, pot_channel.voltage / ADC_VCC))
+    return max(0.0, min(1.0, read_voltage(pot_channel) / ADC_VCC))
 
 
 def pot_monitor_loop():
@@ -185,8 +207,13 @@ def pot_monitor_loop():
     right now. This is where the eventual "boost NeoPixel brightness past
     POT_BRIGHTNESS_THRESHOLD_FRACTION" logic will hook in."""
     while not _pot_stop_event.is_set():
-        fraction = read_pot_fraction()
-        print(f"Pot: {pot_channel.voltage:.2f}V ({fraction * 100:.0f}%)")
+        try:
+            fraction = read_pot_fraction()
+            print(f"Pot: {fraction * ADC_VCC:.2f}V ({fraction * 100:.0f}%)")
+        except OSError as exc:
+            # Retries in read_voltage() were already exhausted - log and keep
+            # the thread alive rather than dying on a transient I2C glitch.
+            print(f"Pot read failed, will retry: {exc}", file=sys.stderr)
         _pot_stop_event.wait(POT_POLL_INTERVAL_SECONDS)
 
 
