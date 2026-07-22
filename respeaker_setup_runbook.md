@@ -92,9 +92,10 @@ sudo apt install -y ffmpeg libusb-1.0-0 i2c-tools
 - `ffmpeg` — used by `audio_io.py` to record straight to WebM/Opus or M4A/AAC.
 - `libusb-1.0-0` — backend `pyusb` needs to talk to the USB thermal printer.
 - `i2c-tools` — optional, but `i2cdetect -y 1` is the fastest way to confirm the
-  Qwiic button is wired correctly (look for it at address `0x6f`).
+  ADS1015 (button + potentiometer) is wired correctly (look for it at address
+  `0x48`).
 
-### Enable I2C (needed for the Qwiic button)
+### Enable I2C (needed for the ADS1015)
 
 ```bash
 sudo raspi-config nonint do_i2c 0
@@ -111,12 +112,14 @@ uses root's own site-packages — separate from your user's — so install these
 with `sudo python3 ...` even though `pip3 list` shows them for your user:
 
 ```bash
-sudo pip3 install rpi_ws281x sparkfun-qwiic-button pillow requests \
+sudo pip3 install rpi_ws281x adafruit-circuitpython-ads1x15 pillow requests \
     "python-escpos[usb]" --break-system-packages
 ```
 
 - `rpi_ws281x` — drives the NeoPixel strip on GPIO12 (PWM0/DMA).
-- `sparkfun-qwiic-button` — the `qwiic_button` module for the SparkFun Qwiic button.
+- `adafruit-circuitpython-ads1x15` — reads the button (A3) and potentiometer
+  (A2) off the Adafruit ADS1015 ADC. Pulls in Adafruit Blinka (`board`/`busio`)
+  as a dependency, which is how it talks to the Pi's I2C bus.
 - `pillow` — image handling for the receipts (`PIL.Image`).
 - `requests` — POSTing audio to the receipt-generation API.
 - `python-escpos[usb]` — **the `[usb]` extra matters.** Plain `python-escpos`
@@ -127,8 +130,13 @@ sudo pip3 install rpi_ws281x sparkfun-qwiic-button pillow requests \
 ### Gotchas
 
 - **Must run as root:** `sudo python3 button_neopixel_printer.py` — required
-  for the NeoPixel PWM/DMA access; the printer and I2C button also end up
+  for the NeoPixel PWM/DMA access; the printer and the ADS1015 also end up
   needing root in the same process.
+- **Button polarity is active-low:** the button on ADS1015 channel A3 has a
+  hardware pull-up, so it reads near `ADC_VCC` (3.3V) when open and drops
+  toward 0V when pressed. `is_button_pressed()` in `button_neopixel_printer.py`
+  thresholds at half of `ADC_VCC` — if your button is wired the opposite way
+  (pull-down instead of pull-up), flip that comparison.
 - **`[usb]` extra + sudo, together:** the USB printing error above almost
   always means one of these two was skipped, not that pyusb/libusb are
   actually absent from the system.
@@ -180,7 +188,7 @@ sudo nano /etc/systemd/system/button-printer.service
 
 ```ini
 [Unit]
-Description=Qwiic button / NeoPixel / receipt printer
+Description=ADS1015 button+pot / NeoPixel / receipt printer
 After=network-online.target sound.target
 Wants=network-online.target
 

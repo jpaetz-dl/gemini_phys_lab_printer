@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-Qwiic button -> hold-to-record -> NeoPixel pulse + AI receipt print.
+ADS1015 button + pot -> hold-to-record -> NeoPixel pulse + AI receipt print.
+
+The physical button no longer has its own LED (it's a plain momentary switch
+wired to A3 on an Adafruit ADS1015 ADC, with a hardware pull-up - reads near
+ADC_VCC when open, drops near 0V when pressed). A potentiometer is wired to
+A2 on the same ADS1015, for a future brightness control.
 
 Press and hold the button while talking:
-  - the button's own LED lights solid (recording indicator)
+  - the NeoPixel strip on GPIO12 turns solid green (recording indicator -
+    replaces the old Qwiic button's onboard LED)
   - audio is recorded from the ReSpeaker mic to an M4A file, for as long as
     the button is held
 
 Release the button:
-  - the button LED turns off
-  - the 38-LED NeoPixel strip on GPIO12 starts pulsing a soft white (its
-    steady-state color is a dim, resting version of the same white) and the
-    Jeopardy! "Think Music" theme loops on the USB speaker
+  - the 38-LED NeoPixel strip starts pulsing a soft white (its steady-state
+    color is a dim, resting version of the same white) and the Jeopardy!
+    "Think Music" theme loops on the USB speaker
   - concurrently, the recording is POSTed to the receipt-generation API
     (equivalent to:
        curl -X POST -F "audio=@recording.m4a;type=audio/mp4" \
@@ -28,7 +33,7 @@ Dependencies (install with pip3). Note the [usb] extra on python-escpos -
 without it, pyusb isn't installed and USB printing fails with
 "requires a usb library to be installed". Must be installed for root too
 (sudo's Python uses root's own site-packages, separate from your user's):
-    sudo pip3 install rpi_ws281x sparkfun-qwiic-button pillow requests \
+    sudo pip3 install rpi_ws281x adafruit-circuitpython-ads1x15 pillow requests \
         "python-escpos[usb]" --break-system-packages
     sudo apt install ffmpeg
 
@@ -49,7 +54,10 @@ import threading
 import time
 
 from rpi_ws281x import Color, PixelStrip
-import qwiic_button
+import board
+import busio
+import adafruit_ads1x15.ads1015 as ADS
+from adafruit_ads1x15.analog_in import AnalogIn
 
 from audio_io import (
     RESPEAKER_DEVICE,
@@ -78,17 +86,30 @@ LED_CHANNEL = 0         # PWM channel 0 for GPIO12/18
 LED_MAX_BRIGHTNESS = 255
 IDLE_COLOR = Color(15, 15, 15)     # soft, dim white - steady-state / resting color
 PULSE_COLOR = Color(255, 255, 255)  # same white, pulsed brighter, while working
+BUTTON_COLOR = Color(0, 255, 0)    # solid green while the button is held (no LED on the button itself anymore)
 PULSE_COUNT = 3            # fallback pulse count when pulse() is run without a stop_event
 PULSE_STEP_DELAY = 0.02   # seconds between brightness steps; lower = faster pulse
 
-# Qwiic button (default I2C address is 0x6F on SparkFun Qwiic buttons)
-BUTTON_I2C_ADDRESS = 0x6F
-DEBOUNCE_MS = 150          # hardware debounce, passed to the button itself
-BUTTON_LED_BRIGHTNESS = 255  # brightness of the button's own LED while recording
+# Adafruit ADS1015 ADC - replaces the SparkFun Qwiic button. Button is on A3
+# (external pull-up: reads near ADC_VCC when open, drops near 0V when
+# pressed); potentiometer wiper is on A2.
+ADS1015_I2C_ADDRESS = 0x48
+BUTTON_ADC_CHANNEL = ADS.P3
+POT_ADC_CHANNEL = ADS.P2
+ADC_VCC = 3.3  # supply voltage feeding the button pull-up / pot, for thresholds
+BUTTON_PRESSED_VOLTAGE_THRESHOLD = ADC_VCC / 2  # below this = pressed (pulled toward GND)
+
+# Potentiometer - just monitored/printed for now. Eventually: boost NeoPixel
+# brightness once the pot is turned past this fraction (not wired up yet).
+POT_BRIGHTNESS_THRESHOLD_FRACTION = 0.75
+POT_POLL_INTERVAL_SECONDS = 0.5
 
 # Software debounce/backstop. The mechanical switch can bounce for a few ms
 # right at the press/release transitions; requiring several consecutive
-# consistent reads before believing an edge filters that out.
+# consistent reads before believing an edge filters that out. There's no
+# hardware debounce anymore (the Qwiic button's firmware used to handle
+# that), so this is the only debounce now - bump these up if presses still
+# look noisy.
 STABLE_READS_REQUIRED = 4    # consecutive matching reads needed to confirm an edge
 STABLE_READ_INTERVAL = 0.01  # seconds between confirmation reads (~40ms total)
 POST_RELEASE_GUARD_SECONDS = 0.3  # brief pause before re-arming for the next press
@@ -125,22 +146,48 @@ strip = PixelStrip(LED_COUNT, LED_PIN, LED_FREQ_HZ, LED_DMA,
                     LED_INVERT, LED_MAX_BRIGHTNESS, LED_CHANNEL)
 strip.begin()
 
-button = qwiic_button.QwiicButton(address=BUTTON_I2C_ADDRESS)
+i2c = busio.I2C(board.SCL, board.SDA)
+ads = ADS.ADS1015(i2c, address=ADS1015_I2C_ADDRESS)
+button_channel = AnalogIn(ads, BUTTON_ADC_CHANNEL)
+pot_channel = AnalogIn(ads, POT_ADC_CHANNEL)
 
 # Tracks an in-progress recording/playback so cleanup() can stop them if the
 # script is interrupted mid-hold or mid-"working" animation.
 _active_recording_proc = None
 _active_playback_proc = None
 
+# Set once main() starts the pot-monitoring thread; cleared to stop it.
+_pot_stop_event = threading.Event()
 
-def init_button():
-    if not button.is_connected():
-        sys.exit("Qwiic button not found on I2C bus - check wiring/address.")
-    button.begin()
-    button.set_debounce_time(DEBOUNCE_MS)
-    button.LED_off()
-    # Clear any stale event flags left over from before this script started.
-    button.clear_event_bits()
+
+def init_adc():
+    try:
+        button_channel.voltage
+        pot_channel.voltage
+    except OSError as exc:
+        sys.exit(f"ADS1015 not found on I2C bus (address {hex(ADS1015_I2C_ADDRESS)}) "
+                  f"- check wiring/address: {exc}")
+
+
+def is_button_pressed():
+    """True if the button is pressed - the pull-up reads near ADC_VCC when
+    open, and gets pulled down toward 0V when the button is held."""
+    return button_channel.voltage < BUTTON_PRESSED_VOLTAGE_THRESHOLD
+
+
+def read_pot_fraction():
+    """Potentiometer position as a 0.0-1.0 fraction of ADC_VCC."""
+    return max(0.0, min(1.0, pot_channel.voltage / ADC_VCC))
+
+
+def pot_monitor_loop():
+    """Print the pot's position periodically - just for wiring/calibration
+    right now. This is where the eventual "boost NeoPixel brightness past
+    POT_BRIGHTNESS_THRESHOLD_FRACTION" logic will hook in."""
+    while not _pot_stop_event.is_set():
+        fraction = read_pot_fraction()
+        print(f"Pot: {pot_channel.voltage:.2f}V ({fraction * 100:.0f}%)")
+        _pot_stop_event.wait(POT_POLL_INTERVAL_SECONDS)
 
 
 def clear_strip():
@@ -231,11 +278,11 @@ def wait_for_stable_state(target_pressed):
     STABLE_READS_REQUIRED consecutive polls in a row. Used to debounce
     both the press edge and the release edge."""
     while True:
-        if button.is_button_pressed() == target_pressed:
+        if is_button_pressed() == target_pressed:
             consecutive = 1
             for _ in range(STABLE_READS_REQUIRED - 1):
                 time.sleep(STABLE_READ_INTERVAL)
-                if button.is_button_pressed() == target_pressed:
+                if is_button_pressed() == target_pressed:
                     consecutive += 1
                 else:
                     break
@@ -245,9 +292,9 @@ def wait_for_stable_state(target_pressed):
 
 
 def on_button_down(audio_path):
-    """Button just went down: light it up and start recording."""
+    """Button just went down: turn the strip green and start recording."""
     print("Button pressed - recording...")
-    button.LED_on(BUTTON_LED_BRIGHTNESS)
+    set_all(BUTTON_COLOR)
     global _active_recording_proc
     _active_recording_proc = start_recording_m4a(
         audio_path, device=RESPEAKER_DEVICE, rate=SAMPLE_RATE, channels=CHANNELS)
@@ -258,7 +305,6 @@ def on_button_up(audio_path, api_url, api_style, receipt_output):
     "working" music, send the audio off, and print whatever receipt comes
     back - stopping the pulse/music right as printing starts."""
     print("Button released - stopping recording, pulsing LEDs, and generating receipt.")
-    button.LED_off()
 
     # Start the pulse animation and the Jeopardy loop immediately, so there's
     # instant feedback on release. Both run until stop_working_feedback() is
@@ -309,16 +355,13 @@ def on_button_up(audio_path, api_url, api_style, receipt_output):
 
 def cleanup(*_args):
     global _active_recording_proc, _active_playback_proc
+    _pot_stop_event.set()
     if _active_recording_proc is not None:
         stop_recording(_active_recording_proc)
         _active_recording_proc = None
     if _active_playback_proc is not None:
         stop_playback(_active_playback_proc)
         _active_playback_proc = None
-    try:
-        button.LED_off()
-    except Exception:
-        pass
     clear_strip()
     sys.exit(0)
 
@@ -360,8 +403,12 @@ def main():
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
 
-    init_button()
+    init_adc()
     set_idle()
+
+    pot_thread = threading.Thread(target=pot_monitor_loop, daemon=True)
+    pot_thread.start()
+
     print("Ready. Press and hold the button to record, release to send + print "
           "(Ctrl+C to quit)...")
 
@@ -372,7 +419,6 @@ def main():
         wait_for_stable_state(False)
         on_button_up(args.audio_output, args.url, args.style, args.receipt_output)
 
-        button.clear_event_bits()
         time.sleep(POST_RELEASE_GUARD_SECONDS)
 
 

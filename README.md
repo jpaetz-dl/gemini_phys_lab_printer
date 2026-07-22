@@ -1,8 +1,9 @@
 # Gemini Phys Lab Printer
 
-Raspberry Pi setup: a SparkFun Qwiic button, a NeoPixel strip, a ReSpeaker
-2-Mics HAT, and a USB thermal receipt printer. Hold the button and talk, and
-it prints an AI-generated receipt of what you said.
+Raspberry Pi setup: a button + potentiometer wired to an Adafruit ADS1015
+ADC, a NeoPixel strip, a ReSpeaker 2-Mics HAT, and a USB thermal receipt
+printer. Hold the button and talk, and it prints an AI-generated receipt of
+what you said.
 
 One-time hardware/OS setup (ALSA devices, I2C, driver overlays, system
 packages) is in [`respeaker_setup_runbook.md`](respeaker_setup_runbook.md) —
@@ -22,10 +23,13 @@ do that first. This README covers how to run each script.
 
 ## `button_neopixel_printer.py`
 
-The main script. Press and hold the Qwiic button while talking — its LED
-lights up and it records from the ReSpeaker mic. Release it, and the NeoPixel
-strip on GPIO12 pulses three times while the recording is sent to the receipt
-API; whatever JPEG comes back gets printed.
+The main script. Press and hold the button while talking — the NeoPixel
+strip turns solid green (there's no LED on the button itself anymore) and
+it records from the ReSpeaker mic. Release it, and the strip pulses a soft
+white while the recording is sent to the receipt API; whatever JPEG comes
+back gets printed, and the pulsing stops right as it does. A potentiometer
+on the same ADS1015 is also read and its position printed to the console
+(brightness control planned but not wired up yet).
 
 Requires root (GPIO12's PWM/DMA access needs it):
 
@@ -56,12 +60,14 @@ sudo python3 button_neopixel_printer.py --style pencilSketch
 sudo python3 button_neopixel_printer.py --test-image testReceipt_01_80mm.png
 ```
 
-Ctrl+C stops it cleanly (turns off the button LED and clears the NeoPixels;
-if you interrupt mid-recording it also stops ffmpeg gracefully rather than
-leaving a corrupt file).
+Ctrl+C stops it cleanly (clears the NeoPixels and stops the pot-monitor
+thread; if you interrupt mid-recording it also stops ffmpeg gracefully
+rather than leaving a corrupt file).
 
 Hardware constants worth knowing about if yours differ (edit the top of the
-file): `LED_COUNT` (38), `LED_PIN` (GPIO12), `BUTTON_I2C_ADDRESS` (`0x6F`),
+file): `LED_COUNT` (38), `LED_PIN` (GPIO12), `ADS1015_I2C_ADDRESS` (`0x48`),
+`BUTTON_ADC_CHANNEL`/`POT_ADC_CHANNEL` (A3/A2), `ADC_VCC` (`3.3`, used to
+threshold the button's pull-up voltage and normalize the pot reading),
 `PRINTER_VENDOR_ID`/`PRINTER_PRODUCT_ID` (`0x0483`/`0x5743`, the "bt_large"
 80mm printer).
 
@@ -176,7 +182,7 @@ for the full install list (apt + pip). The short version:
 
 ```bash
 sudo apt install -y ffmpeg libusb-1.0-0 i2c-tools
-sudo pip3 install rpi_ws281x sparkfun-qwiic-button pillow requests \
+sudo pip3 install rpi_ws281x adafruit-circuitpython-ads1x15 pillow requests \
     "python-escpos[usb]" --break-system-packages
 ```
 
