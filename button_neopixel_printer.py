@@ -94,8 +94,8 @@ PULSE_STEP_DELAY = 0.02   # seconds between brightness steps; lower = faster pul
 # (external pull-up: reads near ADC_VCC when open, drops near 0V when
 # pressed); potentiometer wiper is on A2.
 ADS1015_I2C_ADDRESS = 0x48
-BUTTON_ADC_CHANNEL = ADS.P3
-POT_ADC_CHANNEL = ADS.P2
+BUTTON_ADC_CHANNEL = 3  # A3 - AnalogIn takes plain channel numbers, not named constants
+POT_ADC_CHANNEL = 2     # A2
 ADC_VCC = 3.3  # supply voltage feeding the button pull-up / pot, for thresholds
 BUTTON_PRESSED_VOLTAGE_THRESHOLD = ADC_VCC / 2  # below this = pressed (pulled toward GND)
 
