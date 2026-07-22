@@ -106,9 +106,12 @@ BUTTON_PRESSED_VOLTAGE_THRESHOLD = ADC_VCC / 2  # below this = pressed (pulled t
 ADC_READ_RETRIES = 3
 ADC_READ_RETRY_DELAY = 0.05  # seconds between retries
 
-# Potentiometer - just monitored/printed for now. Eventually: boost NeoPixel
-# brightness once the pot is turned past this fraction (not wired up yet).
-POT_BRIGHTNESS_THRESHOLD_FRACTION = 0.75
+# Potentiometer - past this fraction, the idle/resting color switches from
+# dim white to a pale, dim blue. pot_monitor_loop() checks this continuously
+# (whenever the strip isn't busy with a press/pulse), so it updates live as
+# you turn the pot.
+POT_THRESHOLD_FRACTION = 0.75
+POT_ACTIVE_COLOR = Color(10, 15, 30)  # pale, dim blue
 POT_POLL_INTERVAL_SECONDS = 0.5
 
 # Software debounce/backstop. The mechanical switch can bounce for a few ms
@@ -166,6 +169,10 @@ _active_playback_proc = None
 # Set once main() starts the pot-monitoring thread; cleared to stop it.
 _pot_stop_event = threading.Event()
 
+# True while the button is held or the post-release pulse is running, so
+# pot_monitor_loop() knows not to fight over the strip during that window.
+_strip_busy = False
+
 
 def read_voltage(channel, retries=ADC_READ_RETRIES, retry_delay=ADC_READ_RETRY_DELAY):
     """Read an AnalogIn channel's voltage, retrying briefly on OSError (loose
@@ -202,14 +209,21 @@ def read_pot_fraction():
     return max(0.0, min(1.0, read_voltage(pot_channel) / ADC_VCC))
 
 
+def idle_color_for_pot(fraction):
+    """Dim white normally, or a pale dim blue once the pot is past
+    POT_THRESHOLD_FRACTION."""
+    return POT_ACTIVE_COLOR if fraction >= POT_THRESHOLD_FRACTION else IDLE_COLOR
+
+
 def pot_monitor_loop():
-    """Print the pot's position periodically - just for wiring/calibration
-    right now. This is where the eventual "boost NeoPixel brightness past
-    POT_BRIGHTNESS_THRESHOLD_FRACTION" logic will hook in."""
+    """Print the pot's position periodically, and - whenever the strip isn't
+    busy with a press/pulse - keep the idle resting color in sync with it."""
     while not _pot_stop_event.is_set():
         try:
             fraction = read_pot_fraction()
             print(f"Pot: {fraction * ADC_VCC:.2f}V ({fraction * 100:.0f}%)")
+            if not _strip_busy:
+                set_all(idle_color_for_pot(fraction))
         except OSError as exc:
             # Retries in read_voltage() were already exhausted - log and keep
             # the thread alive rather than dying on a transient I2C glitch.
@@ -224,8 +238,13 @@ def clear_strip():
 
 
 def set_idle():
-    """Soft, dim white - the strip's steady/resting state."""
-    set_all(IDLE_COLOR)
+    """The strip's steady/resting state: dim white, or pale dim blue if the
+    pot is already past POT_THRESHOLD_FRACTION."""
+    try:
+        fraction = read_pot_fraction()
+    except OSError:
+        fraction = 0.0  # bus hiccup - fall back to the default idle look
+    set_all(idle_color_for_pot(fraction))
 
 
 def set_all(color):
@@ -321,6 +340,8 @@ def wait_for_stable_state(target_pressed):
 def on_button_down(audio_path):
     """Button just went down: turn the strip green and start recording."""
     print("Button pressed - recording...")
+    global _strip_busy
+    _strip_busy = True  # pot_monitor_loop() backs off the strip until we're idle again
     set_all(BUTTON_COLOR)
     global _active_recording_proc
     _active_recording_proc = start_recording_m4a(
@@ -377,7 +398,9 @@ def on_button_up(audio_path, api_url, api_style, receipt_output):
         print(f"Receipt API request failed after {time.monotonic() - request_started:.2f}s: {exc}",
               file=sys.stderr)
 
-    pulse_thread.join()
+    pulse_thread.join()  # pulse() already left the strip at set_idle()'s color
+    global _strip_busy
+    _strip_busy = False
 
 
 def cleanup(*_args):
