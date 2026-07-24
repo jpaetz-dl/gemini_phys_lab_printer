@@ -7,24 +7,33 @@ wired to A3 on an Adafruit ADS1015 ADC, with a hardware pull-up - reads near
 ADC_VCC when open, drops near 0V when pressed). A potentiometer is wired to
 A2 on the same ADS1015, for a future brightness control.
 
+The NeoPixel strip's state is driven by the potentiometer on A2 and by the
+button/print cycle:
+  - pot below POT_ON_THRESHOLD_FRACTION (40%): strip off
+  - pot at/above that: strip full-brightness white (BASE_COLOR) at rest
+  - button held: a short comet-tail chase animation in BASE_COLOR (replaces
+    the old Qwiic button's onboard LED as the recording indicator)
+  - button released, waiting on the receipt API and then on the print job:
+    the strip pulses (breathes between a dim floor and BASE_COLOR), and the
+    Jeopardy! "Think Music" theme loops on the USB speaker
+  - once the receipt image has actually been printed: pulsing/music stop and
+    the strip returns to its normal pot-driven state (off or full brightness)
+
 Press and hold the button while talking:
-  - the NeoPixel strip on GPIO12 turns solid green (recording indicator -
-    replaces the old Qwiic button's onboard LED)
+  - the NeoPixel strip does the comet-tail chase animation
   - audio is recorded from the ReSpeaker mic to an M4A file, for as long as
     the button is held
 
 Release the button:
-  - the 38-LED NeoPixel strip starts pulsing a soft white (its steady-state
-    color is a dim, resting version of the same white) and the Jeopardy!
-    "Think Music" theme loops on the USB speaker
+  - the strip starts pulsing and the Jeopardy! theme loops on the USB speaker
   - concurrently, the recording is POSTed to the receipt-generation API
     (equivalent to:
        curl -X POST -F "audio=@recording.m4a;type=audio/mp4" \
          "https://daily-printer-129172578078.us-central1.run.app/api/generate-receipt?style=computationalHalftone" \
          --output receipt.jpeg
     )
-  - once the JPEG comes back, the pulsing and music stop (back to the dim
-    steady state) right as it's sent to the USB thermal receipt printer
+  - once the JPEG comes back AND has been sent to the printer, the
+    pulsing/music stop and the strip returns to normal full brightness
 
 Reuses audio_io.py (mic recording/upload) and reflect_and_print.py (response
 image extraction + printing) so all three scripts share one implementation.
@@ -84,11 +93,15 @@ LED_DMA = 10            # DMA channel to use for generating signal
 LED_INVERT = False      # True to invert the signal (level shifter)
 LED_CHANNEL = 0         # PWM channel 0 for GPIO12/18
 LED_MAX_BRIGHTNESS = 255
-IDLE_COLOR = Color(15, 15, 15)     # soft, dim white - steady-state / resting color
-PULSE_COLOR = Color(255, 255, 255)  # same white, pulsed brighter, while working
-BUTTON_COLOR = Color(0, 255, 0)    # solid green while the button is held (no LED on the button itself anymore)
+OFF_COLOR = Color(0, 0, 0)
+BASE_COLOR = Color(255, 255, 255)   # full-brightness white: idle-on state, chase color, pulse peak
+PULSE_FLOOR_COLOR = Color(15, 15, 15)  # dim floor for the pulse breathing effect (never goes fully dark)
 PULSE_COUNT = 3            # fallback pulse count when pulse() is run without a stop_event
 PULSE_STEP_DELAY = 0.02   # seconds between brightness steps; lower = faster pulse
+
+# Comet-tail chase animation while the button is held.
+CHASE_TAIL_LENGTH = 6     # number of pixels in the fading tail
+CHASE_STEP_DELAY = 0.03   # seconds between each step of the chase; lower = faster
 
 # Adafruit ADS1015 ADC - replaces the SparkFun Qwiic button. Button is on A3
 # (external pull-up: reads near ADC_VCC when open, drops near 0V when
@@ -106,12 +119,11 @@ BUTTON_PRESSED_VOLTAGE_THRESHOLD = ADC_VCC / 2  # below this = pressed (pulled t
 ADC_READ_RETRIES = 3
 ADC_READ_RETRY_DELAY = 0.05  # seconds between retries
 
-# Potentiometer - past this fraction, the idle/resting color switches from
-# dim white to a pale, dim blue. pot_monitor_loop() checks this continuously
-# (whenever the strip isn't busy with a press/pulse), so it updates live as
-# you turn the pot.
-POT_THRESHOLD_FRACTION = 0.75
-POT_ACTIVE_COLOR = Color(10, 15, 30)  # pale, dim blue
+# Potentiometer - below this fraction the strip stays off entirely; at/above
+# it, the strip sits at full-brightness BASE_COLOR. pot_monitor_loop() checks
+# this continuously (whenever the strip isn't busy with a press/pulse), so it
+# updates live as you turn the pot.
+POT_ON_THRESHOLD_FRACTION = 0.40
 POT_POLL_INTERVAL_SECONDS = 0.5
 
 # Software debounce/backstop. The mechanical switch can bounce for a few ms
@@ -173,6 +185,11 @@ _pot_stop_event = threading.Event()
 # pot_monitor_loop() knows not to fight over the strip during that window.
 _strip_busy = False
 
+# Tracks the in-progress chase animation so cleanup() can stop it if the
+# script is interrupted mid-hold.
+_chase_thread = None
+_chase_stop_event = None
+
 
 def read_voltage(channel, retries=ADC_READ_RETRIES, retry_delay=ADC_READ_RETRY_DELAY):
     """Read an AnalogIn channel's voltage, retrying briefly on OSError (loose
@@ -210,9 +227,8 @@ def read_pot_fraction():
 
 
 def idle_color_for_pot(fraction):
-    """Dim white normally, or a pale dim blue once the pot is past
-    POT_THRESHOLD_FRACTION."""
-    return POT_ACTIVE_COLOR if fraction >= POT_THRESHOLD_FRACTION else IDLE_COLOR
+    """Off below POT_ON_THRESHOLD_FRACTION, full-brightness BASE_COLOR at/above it."""
+    return BASE_COLOR if fraction >= POT_ON_THRESHOLD_FRACTION else OFF_COLOR
 
 
 def pot_monitor_loop():
@@ -238,8 +254,8 @@ def clear_strip():
 
 
 def set_idle():
-    """The strip's steady/resting state: dim white, or pale dim blue if the
-    pot is already past POT_THRESHOLD_FRACTION."""
+    """The strip's steady/resting state: off, or full-brightness BASE_COLOR
+    if the pot is already past POT_ON_THRESHOLD_FRACTION."""
     try:
         fraction = read_pot_fraction()
     except OSError:
@@ -273,14 +289,15 @@ def lerp_color(color_a, color_b, t):
     )
 
 
-def pulse(color=PULSE_COLOR, base_color=IDLE_COLOR, stop_event=None, times=PULSE_COUNT):
-    """Breathe the whole strip between `base_color` (the dim idle color) and
-    `color` (full brightness) - it never goes fully dark.
+def pulse(color=BASE_COLOR, base_color=PULSE_FLOOR_COLOR, stop_event=None, times=PULSE_COUNT):
+    """Breathe the whole strip between `base_color` (a dim floor) and `color`
+    (full brightness) - it never goes fully dark.
 
     If `stop_event` is given, pulses repeatedly until it's set (this is the
-    "working" animation that runs from button release until the receipt
-    starts printing). Otherwise pulses a fixed `times` and stops. Either way,
-    leaves the strip at the dim white idle/steady state when done.
+    "working" animation that runs from button release through the receipt
+    API call and the print job itself). Otherwise pulses a fixed `times` and
+    stops. Either way, leaves the strip at its normal pot-driven state (off
+    or full brightness) when done.
     """
     steps = 50
 
@@ -300,6 +317,45 @@ def pulse(color=PULSE_COLOR, base_color=IDLE_COLOR, stop_event=None, times=PULSE
             one_cycle()
 
     set_idle()
+
+
+def chase(color=BASE_COLOR, stop_event=None, cycles=1,
+          tail_length=CHASE_TAIL_LENGTH, step_delay=CHASE_STEP_DELAY):
+    """Comet-tail chase animation: a lit pixel with a fading tail travels
+    around the strip in a loop.
+
+    If `stop_event` is given, loops until it's set (this is the "button
+    held/recording" animation). Otherwise loops `cycles` full trips around
+    the strip and stops. Either way, clears the strip when done - the caller
+    is expected to immediately start whatever comes next (pulse or idle).
+    """
+    n = strip.numPixels()
+    position = 0
+    completed_cycles = 0
+
+    while True:
+        for i in range(n):
+            distance = (position - i) % n
+            if distance < tail_length:
+                brightness = 1.0 - (distance / tail_length)
+                strip.setPixelColor(i, lerp_color(OFF_COLOR, color, brightness))
+            else:
+                strip.setPixelColor(i, OFF_COLOR)
+        strip.show()
+        time.sleep(step_delay)
+
+        position += 1
+        if position >= n:
+            position = 0
+            completed_cycles += 1
+
+        if stop_event is not None:
+            if stop_event.is_set():
+                break
+        elif completed_cycles >= cycles:
+            break
+
+    clear_strip()
 
 
 def print_receipt(image_path=RECEIPT_IMAGE_PATH):
@@ -338,25 +394,39 @@ def wait_for_stable_state(target_pressed):
 
 
 def on_button_down(audio_path):
-    """Button just went down: turn the strip green and start recording."""
+    """Button just went down: start the comet-tail chase animation and start recording."""
     print("Button pressed - recording...")
+
     global _strip_busy
     _strip_busy = True  # pot_monitor_loop() backs off the strip until we're idle again
-    set_all(BUTTON_COLOR)
+
+    global _chase_stop_event, _chase_thread
+    _chase_stop_event = threading.Event()
+    _chase_thread = threading.Thread(target=chase, kwargs={"stop_event": _chase_stop_event}, daemon=True)
+    _chase_thread.start()
+
     global _active_recording_proc
     _active_recording_proc = start_recording_m4a(
         audio_path, device=RESPEAKER_DEVICE, rate=SAMPLE_RATE, channels=CHANNELS)
 
 
 def on_button_up(audio_path, api_url, api_style, receipt_output):
-    """Button just released: stop recording, pulse the strip + loop the
-    "working" music, send the audio off, and print whatever receipt comes
-    back - stopping the pulse/music right as printing starts."""
+    """Button just released: stop the chase + recording, pulse the strip +
+    loop the "working" music, send the audio off, and print whatever receipt
+    comes back - stopping the pulse/music once printing actually finishes."""
     print("Button released - stopping recording, pulsing LEDs, and generating receipt.")
+
+    # Stop the chase animation now that the button's been released.
+    global _chase_stop_event, _chase_thread
+    if _chase_stop_event is not None:
+        _chase_stop_event.set()
+    if _chase_thread is not None:
+        _chase_thread.join()
+        _chase_thread = None
 
     # Start the pulse animation and the Jeopardy loop immediately, so there's
     # instant feedback on release. Both run until stop_working_feedback() is
-    # called, right before the receipt is sent to the printer.
+    # called, once the receipt has actually been printed.
     stop_pulse_event = threading.Event()
     pulse_thread = threading.Thread(target=pulse, kwargs={"stop_event": stop_pulse_event}, daemon=True)
     pulse_thread.start()
@@ -391,8 +461,8 @@ def on_button_up(audio_path, api_url, api_style, receipt_output):
         except Exception as exc:
             print(f"Couldn't save a local copy of the receipt: {exc}", file=sys.stderr)
 
-        stop_working_feedback()  # paper's about to start printing
         print_image(image_obj)
+        stop_working_feedback()  # image is printed - back to normal full brightness
     except Exception as exc:
         stop_working_feedback()  # give up cleanly either way
         print(f"Receipt API request failed after {time.monotonic() - request_started:.2f}s: {exc}",
@@ -404,8 +474,13 @@ def on_button_up(audio_path, api_url, api_style, receipt_output):
 
 
 def cleanup(*_args):
-    global _active_recording_proc, _active_playback_proc
+    global _active_recording_proc, _active_playback_proc, _chase_stop_event, _chase_thread
     _pot_stop_event.set()
+    if _chase_stop_event is not None:
+        _chase_stop_event.set()
+    if _chase_thread is not None:
+        _chase_thread.join(timeout=2)
+        _chase_thread = None
     if _active_recording_proc is not None:
         stop_recording(_active_recording_proc)
         _active_recording_proc = None
