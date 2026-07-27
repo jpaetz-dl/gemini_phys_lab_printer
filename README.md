@@ -77,7 +77,7 @@ threshold the button's pull-up voltage and normalize the pot reading),
 
 Low-level mic/speaker utility — this is what `button_neopixel_printer.py` and
 `reflect_and_print.py` build on, and it's also useful standalone for testing
-the ReSpeaker/speaker independently. Four subcommands:
+the ReSpeaker/speaker independently. Five subcommands:
 
 ```bash
 # Record 5s (default) to a WAV file
@@ -95,6 +95,10 @@ python3 audio_io.py test -o test_recording.wav -d 5 --in-device <dev> --out-devi
 # Record to WebM and POST it to the receipt API
 python3 audio_io.py reflect
 python3 audio_io.py reflect -o reflection.webm -d 10 --url http://10.18.44.99:5005/api/generate-receipt
+
+# Set mic capture / speaker playback volume (via amixer)
+python3 audio_io.py levels
+python3 audio_io.py levels --mic-percent 60 --speaker-percent 70
 ```
 
 | Subcommand | Flags |
@@ -103,11 +107,20 @@ python3 audio_io.py reflect -o reflection.webm -d 10 --url http://10.18.44.99:50
 | `play INPUT` | `--device` (ALSA output) |
 | `test` | `-o/--output` (default `test_recording.wav`), `-d/--duration`, `--in-device`, `--out-device` |
 | `reflect` | `-o/--output` (default `reflection.webm`), `-d/--duration` (default 10s), `--device`, `--url` |
+| `levels` | `--mic-percent` (default 40), `--speaker-percent` (default 40) |
 
 Note: the press-and-hold recording in `button_neopixel_printer.py` uses
 `start_recording_m4a()`/`stop_recording()` from this module directly (not
 exposed as a CLI subcommand here), since it needs an open-ended recording
 rather than a fixed duration.
+
+`button_neopixel_printer.py` also calls `set_default_levels()` itself at
+startup, so mic/speaker volume gets (re-)set every time that script runs —
+including on boot, since it's the one running under systemd (see the runbook's
+section 10). Card names/control names (`MIC_CARD`, `MIC_CAPTURE_CONTROL`,
+`SPEAKER_CARD`, `SPEAKER_CONTROL`) are constants at the top of `audio_io.py` —
+if a Pi's card exposes different control names, find the right ones with
+`amixer -c <card name> scontrols`.
 
 ---
 

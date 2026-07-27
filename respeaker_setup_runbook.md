@@ -63,6 +63,12 @@ alsamixer
 
 Without raising the capture level here, recordings from the mics come in silent/too quiet.
 
+This manual pass is only needed once, to confirm the hardware and find the
+right levels. After that, `audio_io.py`'s `set_default_levels()` sets these
+same two levels via `amixer` in code (see the README's `audio_io.py` section)
+— `button_neopixel_printer.py` calls it automatically on every startup, so a
+fresh boot doesn't depend on whatever alsamixer was last left at.
+
 ## 6. Record a test clip with the ReSpeaker mics
 
 ```bash

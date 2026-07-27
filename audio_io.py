@@ -34,8 +34,48 @@ SAMPLE_RATE = 16000
 CHANNELS = 2
 SAMPLE_FORMAT = "S16_LE"
 
+# --- Mixer levels (set via `amixer`, same tool alsamixer uses under the hood) ---
+# Card names here match the CARD= part of RESPEAKER_DEVICE/SPEAKER_DEVICE above,
+# not the full device string. Control names ("Capture", "PCM") come from what
+# alsamixer showed during setup (respeaker_setup_runbook.md step 5) -- if a
+# given Pi's card exposes different control names, find them with:
+#   amixer -c <card name> scontrols
+MIC_CARD = "seeed2micvoicec"
+MIC_CAPTURE_CONTROL = "Capture"
+MIC_CAPTURE_LEVEL = 40  # percent; matches the level used in the runbook
+
+SPEAKER_CARD = "UACDemoV10"
+SPEAKER_CONTROL = "PCM"
+SPEAKER_LEVEL = 40  # percent
+
 # --- Remote API ---
 DEFAULT_API_URL = "http://10.18.44.99:5005/api/generate-receipt"
+
+
+def set_alsa_volume(card, control, percent):
+    """Set an ALSA mixer control's level. Equivalent to:
+
+        amixer -c <card> sset <control> <percent>%
+
+    `card` is the card name from `aplay -l`/`arecord -l` (e.g. 'seeed2micvoicec'),
+    not a full device string like RESPEAKER_DEVICE. Raises CalledProcessError
+    (with amixer's own error, usually "Unable to find simple control") if
+    `control` doesn't exist on that card -- run `amixer -c <card> scontrols`
+    to see the actual control names.
+    """
+    cmd = ["amixer", "-c", card, "sset", control, f"{percent}%"]
+    print(f"Setting {card} '{control}' to {percent}%")
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+
+
+def set_default_levels(mic_percent=MIC_CAPTURE_LEVEL, speaker_percent=SPEAKER_LEVEL):
+    """Set the mic capture level and speaker playback level to their
+    configured defaults. Meant to be called once at startup (e.g. from
+    button_neopixel_printer.py's main(), or this module's own `levels`
+    CLI command) so levels don't depend on whatever alsamixer was last
+    left at."""
+    set_alsa_volume(MIC_CARD, MIC_CAPTURE_CONTROL, mic_percent)
+    set_alsa_volume(SPEAKER_CARD, SPEAKER_CONTROL, speaker_percent)
 
 
 def record_audio(output_path, duration=5, device=RESPEAKER_DEVICE,
@@ -249,6 +289,12 @@ def main():
     reflect.add_argument("--device", default=RESPEAKER_DEVICE, help="ALSA input device")
     reflect.add_argument("--url", default=DEFAULT_API_URL, help="API endpoint to POST to")
 
+    levels = sub.add_parser("levels", help="Set mic capture / speaker playback volume")
+    levels.add_argument("--mic-percent", type=int, default=MIC_CAPTURE_LEVEL,
+                         help=f"Mic capture level, 0-100 (default: {MIC_CAPTURE_LEVEL})")
+    levels.add_argument("--speaker-percent", type=int, default=SPEAKER_LEVEL,
+                         help=f"Speaker playback level, 0-100 (default: {SPEAKER_LEVEL})")
+
     args = parser.parse_args()
 
     try:
@@ -262,6 +308,8 @@ def main():
         elif args.command == "reflect":
             record_and_send(args.output, duration=args.duration,
                              device=args.device, url=args.url)
+        elif args.command == "levels":
+            set_default_levels(mic_percent=args.mic_percent, speaker_percent=args.speaker_percent)
     except subprocess.CalledProcessError as e:
         print(f"Command failed: {e}", file=sys.stderr)
         sys.exit(1)

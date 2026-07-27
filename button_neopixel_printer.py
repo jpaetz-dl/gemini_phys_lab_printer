@@ -78,6 +78,7 @@ from audio_io import (
     start_looping_playback,
     stop_playback,
     upload_audio,
+    set_default_levels,
 )
 from reflect_and_print import extract_image, print_image
 
@@ -527,6 +528,14 @@ def main():
 
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
+
+    try:
+        set_default_levels()
+    except Exception as exc:
+        # Don't let a mixer-control mismatch (see audio_io.py's MIC_CARD /
+        # MIC_CAPTURE_CONTROL etc.) stop the whole script from starting.
+        print(f"Couldn't set default mic/speaker levels, continuing anyway: {exc}",
+              file=sys.stderr)
 
     init_adc()
     set_idle()
