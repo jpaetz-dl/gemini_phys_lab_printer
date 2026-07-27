@@ -81,6 +81,7 @@ from audio_io import (
     set_default_levels,
 )
 from reflect_and_print import extract_image, print_image
+from status_io import write_status
 
 # ---------------------------------------------------------------------------
 # Configuration - edit these to match your hardware
@@ -162,17 +163,33 @@ RECEIPT_IMAGE_OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                      "receipt.jpeg")
 
 # ---------------------------------------------------------------------------
-# Hardware setup
+# Hardware setup - deferred to init_hardware(), NOT run at import time. This
+# lets other scripts (status_web.py, status_display.py) import constants and
+# print_receipt() from this module without also grabbing the NeoPixel
+# PWM/DMA channel or the I2C bus out from under the main process.
 # ---------------------------------------------------------------------------
 
-strip = PixelStrip(LED_COUNT, LED_PIN, LED_FREQ_HZ, LED_DMA,
-                    LED_INVERT, LED_MAX_BRIGHTNESS, LED_CHANNEL)
-strip.begin()
+strip = None
+i2c = None
+ads = None
+button_channel = None
+pot_channel = None
 
-i2c = busio.I2C(board.SCL, board.SDA)
-ads = ADS.ADS1015(i2c, address=ADS1015_I2C_ADDRESS)
-button_channel = AnalogIn(ads, BUTTON_ADC_CHANNEL)
-pot_channel = AnalogIn(ads, POT_ADC_CHANNEL)
+
+def init_hardware():
+    """Set up the NeoPixel strip and the ADS1015 ADC. main() calls this
+    first thing - must happen before init_adc() or anything touching
+    strip/button_channel/pot_channel."""
+    global strip, i2c, ads, button_channel, pot_channel
+    strip = PixelStrip(LED_COUNT, LED_PIN, LED_FREQ_HZ, LED_DMA,
+                        LED_INVERT, LED_MAX_BRIGHTNESS, LED_CHANNEL)
+    strip.begin()
+
+    i2c = busio.I2C(board.SCL, board.SDA)
+    ads = ADS.ADS1015(i2c, address=ADS1015_I2C_ADDRESS)
+    button_channel = AnalogIn(ads, BUTTON_ADC_CHANNEL)
+    pot_channel = AnalogIn(ads, POT_ADC_CHANNEL)
+
 
 # Tracks an in-progress recording/playback so cleanup() can stop them if the
 # script is interrupted mid-hold or mid-"working" animation.
@@ -239,6 +256,11 @@ def pot_monitor_loop():
         try:
             fraction = read_pot_fraction()
             print(f"Pot: {fraction * ADC_VCC:.2f}V ({fraction * 100:.0f}%)")
+            write_status(
+                pot_fraction=round(fraction, 3),
+                pot_voltage=round(fraction * ADC_VCC, 2),
+                strip_on=fraction >= POT_ON_THRESHOLD_FRACTION,
+            )
             if not _strip_busy:
                 set_all(idle_color_for_pot(fraction))
         except OSError as exc:
@@ -249,6 +271,8 @@ def pot_monitor_loop():
 
 
 def clear_strip():
+    if strip is None:
+        return  # cleanup() ran before init_hardware() got a chance to - nothing to clear
     for i in range(strip.numPixels()):
         strip.setPixelColor(i, Color(0, 0, 0))
     strip.show()
@@ -361,19 +385,23 @@ def chase(color=BASE_COLOR, stop_event=None, cycles=1,
 
 def print_receipt(image_path=RECEIPT_IMAGE_PATH):
     """Print a local image file directly - handy for testing the printer
-    on its own, independent of the record/upload flow (see --test-image)."""
+    on its own, independent of the record/upload flow (see --test-image and
+    status_web.py's "Test print" button). Returns True on success, False on
+    a missing file or a print failure (also logged to stderr either way)."""
     from escpos.printer import Usb
 
     if not os.path.isfile(image_path):
         print(f"Receipt image not found: {image_path}", file=sys.stderr)
-        return
+        return False
     try:
         printer = Usb(PRINTER_VENDOR_ID, PRINTER_PRODUCT_ID, profile="default")
         printer.image(image_path)
         printer.cut()
         printer.close()
+        return True
     except Exception as exc:
         print(f"Print failed: {exc}", file=sys.stderr)
+        return False
 
 
 def wait_for_stable_state(target_pressed):
@@ -397,6 +425,7 @@ def wait_for_stable_state(target_pressed):
 def on_button_down(audio_path):
     """Button just went down: start the comet-tail chase animation and start recording."""
     print("Button pressed - recording...")
+    write_status(state="recording", recording_started_at=time.time())
 
     global _strip_busy
     _strip_busy = True  # pot_monitor_loop() backs off the strip until we're idle again
@@ -447,6 +476,8 @@ def on_button_up(audio_path, api_url, api_style, receipt_output):
     if proc is not None:
         stop_recording(proc)  # includes the (fast, but blocking) AAC transcode
 
+    write_status(state="generating")
+
     request_started = time.monotonic()
     try:
         resp = upload_audio(
@@ -455,19 +486,28 @@ def on_button_up(audio_path, api_url, api_style, receipt_output):
             content_type="audio/mp4",
             params={"style": api_style} if api_style else None,
         )
-        print(f"Receipt API responded in {time.monotonic() - request_started:.2f}s")
+        request_seconds = time.monotonic() - request_started
+        print(f"Receipt API responded in {request_seconds:.2f}s")
         image_obj = extract_image(resp)
         try:
             image_obj.convert("RGB").save(receipt_output, "JPEG")
         except Exception as exc:
             print(f"Couldn't save a local copy of the receipt: {exc}", file=sys.stderr)
 
+        write_status(state="printing", last_api_response_seconds=round(request_seconds, 2))
         print_image(image_obj)
         stop_working_feedback()  # image is printed - back to normal full brightness
+        write_status(
+            state="idle",
+            last_print_time=time.time(),
+            last_print_style=api_style,
+            last_error=None,
+        )
     except Exception as exc:
         stop_working_feedback()  # give up cleanly either way
         print(f"Receipt API request failed after {time.monotonic() - request_started:.2f}s: {exc}",
               file=sys.stderr)
+        write_status(state="idle", last_error=str(exc), last_error_time=time.time())
 
     pulse_thread.join()  # pulse() already left the strip at set_idle()'s color
     global _strip_busy
@@ -476,6 +516,7 @@ def on_button_up(audio_path, api_url, api_style, receipt_output):
 
 def cleanup(*_args):
     global _active_recording_proc, _active_playback_proc, _chase_stop_event, _chase_thread
+    write_status(state="stopped")
     _pot_stop_event.set()
     if _chase_stop_event is not None:
         _chase_stop_event.set()
@@ -529,6 +570,10 @@ def main():
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
 
+    write_status(state="starting", started_at=time.time(), api_url=args.url)
+
+    init_hardware()
+
     try:
         set_default_levels()
     except Exception as exc:
@@ -539,6 +584,7 @@ def main():
 
     init_adc()
     set_idle()
+    write_status(state="idle")
 
     pot_thread = threading.Thread(target=pot_monitor_loop, daemon=True)
     pot_thread.start()

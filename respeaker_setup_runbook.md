@@ -251,6 +251,124 @@ sudo systemctl disable button-printer.service   # stop it from running at boot
   not in your terminal, use `sudo systemctl stop button-printer.service`
   to stop it instead.
 
+## 11. Status dashboard (HDMI console) + LAN web page
+
+Three scripts work together here: `status_io.py` (shared status file,
+imported by the others - nothing to run directly), `status_display.py`
+(full-screen dashboard for an attached monitor), and `status_web.py` (LAN
+page with a couple of action buttons). `button_neopixel_printer.py` writes
+`status.json` next to itself on every state change; the other two just read
+it, so they work independently of whether the main script is currently
+running.
+
+### Install the one extra dependency
+
+```bash
+sudo pip3 install flask --break-system-packages
+```
+
+### Terminal dashboard on the HDMI monitor (no keyboard/login needed)
+
+This takes over tty1 directly, so first stop the normal login prompt from
+fighting over it:
+
+```bash
+sudo systemctl disable --now getty@tty1.service
+```
+
+Then create the unit:
+
+```bash
+sudo nano /etc/systemd/system/status-display.service
+```
+
+```ini
+[Unit]
+Description=Button/printer status dashboard (tty1)
+After=multi-user.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/gemini_phys_lab_printer
+ExecStart=/usr/bin/python3 /home/pi/gemini_phys_lab_printer/status_display.py
+Restart=always
+RestartSec=2
+User=root
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+(Same placeholder-path caveat as section 10 - swap in the real path/username,
+and keep the script filename on the end of `ExecStart`.)
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now status-display.service
+```
+
+Whatever's plugged into the Pi's HDMI port should now show the dashboard
+directly, refreshing once a second, no login required. If you ever need a
+real login shell on that screen again: `sudo systemctl stop
+status-display.service && sudo systemctl enable --now getty@tty1.service`.
+
+### LAN web page
+
+Separate service, so restarting `button-printer.service` doesn't take the
+web page down too:
+
+```bash
+sudo nano /etc/systemd/system/status-web.service
+```
+
+```ini
+[Unit]
+Description=Button/printer LAN status page
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/gemini_phys_lab_printer
+ExecStart=/usr/bin/python3 /home/pi/gemini_phys_lab_printer/status_web.py
+Restart=on-failure
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now status-web.service
+```
+
+Find the Pi's IP with `hostname -I`, then visit `http://<that IP>:8080` from
+any device on the same network. The page shows state/pot level/last
+print/last error, and has "Test print" and "Restart service" buttons.
+
+### Gotchas
+
+- **Runs as root, same as the other two:** `status-web.py`'s "Restart
+  service" button shells out to `systemctl restart`, and "Test print" opens
+  the USB printer directly - both need root, hence `User=root` again here.
+- **No authentication on the web page.** Anyone on the same network segment
+  can hit those buttons. Fine for a trusted home/lab LAN; don't port-forward
+  this or expose it beyond that without adding some.
+- **`getty@tty1` vs `status-display`:** both want exclusive control of
+  `/dev/tty1`. Disabling `getty@tty1.service` before enabling
+  `status-display.service` is what avoids them fighting over it.
+- **Test print vs. a live print job:** if someone hits "Test print" at the
+  exact moment the main script is already mid-print, one of the two USB
+  opens will fail (device busy) - it'll just show up as a failed test print,
+  not a crash. Rare in practice; just retry.
+
 ---
 
 ### Notes for replicating on other devices

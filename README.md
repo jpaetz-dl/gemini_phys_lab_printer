@@ -14,10 +14,13 @@ do that first. This README covers how to run each script.
 | Script | What it does | Needs sudo? |
 |---|---|---|
 | `button_neopixel_printer.py` | Main flow: hold button to record, release to pulse + print an AI receipt | Yes |
-| `audio_io.py` | Standalone mic/speaker CLI (record/play/test/reflect) | No |
+| `audio_io.py` | Standalone mic/speaker CLI (record/play/test/reflect/levels) | No |
 | `reflect_and_print.py` | One-shot: record a fixed-length clip, send it, print the result | No |
 | `pi_printer_wifi.py` | Polls a laptop's local server for print jobs over Wi-Fi | No |
 | `escpos_test.py` | Printer-only diagnostic tool (no mic/button involved) | No |
+| `status_io.py` | Shared status-file helper (imported by the three below, not run directly) | No |
+| `status_display.py` | Full-screen status dashboard, meant for the Pi's HDMI console | Yes |
+| `status_web.py` | LAN-accessible status page with test-print/restart buttons | Yes |
 
 ---
 
@@ -188,6 +191,36 @@ Named profiles in `PRINTERS`: `bt_small` (58mm), `bt_large` (80mm, the one
 
 ---
 
+## `status_display.py` / `status_web.py` (status dashboard + LAN page)
+
+`button_neopixel_printer.py` writes its current state (idle/recording/
+generating/printing), pot level, last print time/style, and last error to
+`status.json` (via `status_io.py`) on every state change. These two scripts
+just read that file — neither touches GPIO/I2C, so they're safe to run
+alongside the main script, or even if it's not running (they'll just show
+"no status yet").
+
+```bash
+# Full-screen terminal dashboard, refreshes once a second
+python3 status_display.py
+
+# LAN web page - visit http://<pi-ip>:8080 from any device on the network
+python3 status_web.py
+python3 status_web.py --host 0.0.0.0 --port 9000
+```
+
+`status_display.py` is meant to run on the Pi's HDMI console via systemd
+(no keyboard/login needed) — see the runbook's section 11 for that setup,
+plus the `status-web.service` unit for the web page. The web page also has
+"Test print" (reprints the last-generated receipt, or the static test image
+if there isn't one yet) and "Restart service" buttons — both need root,
+which is why `status_web.py` also runs as root under systemd. There's no
+authentication on the page, so it's meant for a trusted home/lab LAN only.
+
+Requires Flask: `sudo pip3 install flask --break-system-packages`
+
+---
+
 ## Dependencies
 
 See [`respeaker_setup_runbook.md`](respeaker_setup_runbook.md#8-install-dependencies-for-the-button--neopixel--printer-scripts)
@@ -196,7 +229,7 @@ for the full install list (apt + pip). The short version:
 ```bash
 sudo apt install -y ffmpeg libusb-1.0-0 i2c-tools
 sudo pip3 install rpi_ws281x adafruit-circuitpython-ads1x15 pillow requests \
-    "python-escpos[usb]" --break-system-packages
+    flask "python-escpos[usb]" --break-system-packages
 ```
 
 Install with `sudo` even if you already installed for your own user — the
