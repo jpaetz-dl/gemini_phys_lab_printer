@@ -8,14 +8,16 @@ ADC_VCC when open, drops near 0V when pressed). A potentiometer is wired to
 A2 on the same ADS1015, for a future brightness control.
 
 The NeoPixel strip's state is driven by the potentiometer on A2 and by the
-button/print cycle:
-  - pot below POT_ON_THRESHOLD_FRACTION (40%): strip off
-  - pot at/above that: strip full-brightness white (BASE_COLOR) at rest
-  - button held: a short comet-tail chase animation in BASE_COLOR (replaces
+button/print cycle. Colors, chase/pulse timing, and the pot on/off threshold
+below all live in config.json (see config_io.py) so they're adjustable live
+from the web page, not hardcoded here:
+  - pot below the configured threshold (default 40%): strip off
+  - pot at/above that: strip full-brightness idle_color (default white) at rest
+  - button held: a short comet-tail chase animation in chase_color (replaces
     the old Qwiic button's onboard LED as the recording indicator)
   - button released, waiting on the receipt API and then on the print job:
-    the strip pulses (breathes between a dim floor and BASE_COLOR), and the
-    Jeopardy! "Think Music" theme loops on the USB speaker
+    the strip pulses (breathes between pulse_floor_color and pulse_color),
+    and the Jeopardy! "Think Music" theme loops on the USB speaker
   - once the receipt image has actually been printed: pulsing/music stop and
     the strip returns to its normal pot-driven state (off or full brightness)
 
@@ -80,8 +82,9 @@ from audio_io import (
     upload_audio,
     set_default_levels,
 )
-from reflect_and_print import extract_image, print_image
+from reflect_and_print import extract_image, print_image, FLIP_180
 from status_io import write_status
+import config_io
 
 # ---------------------------------------------------------------------------
 # Configuration - edit these to match your hardware
@@ -96,14 +99,17 @@ LED_INVERT = False      # True to invert the signal (level shifter)
 LED_CHANNEL = 0         # PWM channel 0 for GPIO12/18
 LED_MAX_BRIGHTNESS = 255
 OFF_COLOR = Color(0, 0, 0)
-BASE_COLOR = Color(255, 255, 255)   # full-brightness white: idle-on state, chase color, pulse peak
-PULSE_FLOOR_COLOR = Color(15, 15, 15)  # dim floor for the pulse breathing effect (never goes fully dark)
 PULSE_COUNT = 3            # fallback pulse count when pulse() is run without a stop_event
-PULSE_STEP_DELAY = 0.02   # seconds between brightness steps; lower = faster pulse
 
-# Comet-tail chase animation while the button is held.
-CHASE_TAIL_LENGTH = 6     # number of pixels in the fading tail
-CHASE_STEP_DELAY = 0.03   # seconds between each step of the chase; lower = faster
+# Idle/chase/pulse colors, pulse/chase timing, and the pot on/off threshold
+# below all live in config.json now (see config_io.py), not as constants
+# here, so they can be changed live from the web page (status_web.py's
+# settings form) without restarting this script. config_io.DEFAULTS has the
+# out-of-the-box values (all start at full-brightness white / the same
+# timing this script always used). Each function that needs one of these
+# values calls config_io.read_config() itself, at the point of use - NOT
+# once into a function default argument, since Python binds defaults at
+# definition time and wouldn't pick up later config.json edits.
 
 # Adafruit ADS1015 ADC - replaces the SparkFun Qwiic button. Button is on A3
 # (external pull-up: reads near ADC_VCC when open, drops near 0V when
@@ -121,11 +127,11 @@ BUTTON_PRESSED_VOLTAGE_THRESHOLD = ADC_VCC / 2  # below this = pressed (pulled t
 ADC_READ_RETRIES = 3
 ADC_READ_RETRY_DELAY = 0.05  # seconds between retries
 
-# Potentiometer - below this fraction the strip stays off entirely; at/above
-# it, the strip sits at full-brightness BASE_COLOR. pot_monitor_loop() checks
-# this continuously (whenever the strip isn't busy with a press/pulse), so it
-# updates live as you turn the pot.
-POT_ON_THRESHOLD_FRACTION = 0.40
+# Potentiometer on/off threshold (config_io: "pot_on_threshold_fraction") -
+# below it the strip stays off entirely; at/above it, the strip sits at
+# full-brightness idle_color. pot_monitor_loop() checks this continuously
+# (whenever the strip isn't busy with a press/pulse), so it updates live as
+# you turn the pot or change the threshold from the web page.
 POT_POLL_INTERVAL_SECONDS = 0.5
 
 # Software debounce/backstop. The mechanical switch can bounce for a few ms
@@ -244,9 +250,18 @@ def read_pot_fraction():
     return max(0.0, min(1.0, read_voltage(pot_channel) / ADC_VCC))
 
 
-def idle_color_for_pot(fraction):
-    """Off below POT_ON_THRESHOLD_FRACTION, full-brightness BASE_COLOR at/above it."""
-    return BASE_COLOR if fraction >= POT_ON_THRESHOLD_FRACTION else OFF_COLOR
+def _color(rgb):
+    """Convert a config.json [r, g, b] list into an rpi_ws281x Color."""
+    return Color(rgb[0], rgb[1], rgb[2])
+
+
+def idle_color_for_pot(fraction, cfg=None):
+    """Off below the configured pot on/off threshold, full-brightness
+    idle_color at/above it. `cfg` can be passed in to reuse an
+    already-read config (e.g. from pot_monitor_loop's own loop iteration)
+    instead of hitting the filesystem again."""
+    cfg = cfg or config_io.read_config()
+    return _color(cfg["idle_color"]) if fraction >= cfg["pot_on_threshold_fraction"] else OFF_COLOR
 
 
 def pot_monitor_loop():
@@ -254,15 +269,17 @@ def pot_monitor_loop():
     busy with a press/pulse - keep the idle resting color in sync with it."""
     while not _pot_stop_event.is_set():
         try:
+            cfg = config_io.read_config()
             fraction = read_pot_fraction()
+            strip_on = fraction >= cfg["pot_on_threshold_fraction"]
             print(f"Pot: {fraction * ADC_VCC:.2f}V ({fraction * 100:.0f}%)")
             write_status(
                 pot_fraction=round(fraction, 3),
                 pot_voltage=round(fraction * ADC_VCC, 2),
-                strip_on=fraction >= POT_ON_THRESHOLD_FRACTION,
+                strip_on=strip_on,
             )
             if not _strip_busy:
-                set_all(idle_color_for_pot(fraction))
+                set_all(idle_color_for_pot(fraction, cfg=cfg))
         except OSError as exc:
             # Retries in read_voltage() were already exhausted - log and keep
             # the thread alive rather than dying on a transient I2C glitch.
@@ -279,8 +296,8 @@ def clear_strip():
 
 
 def set_idle():
-    """The strip's steady/resting state: off, or full-brightness BASE_COLOR
-    if the pot is already past POT_ON_THRESHOLD_FRACTION."""
+    """The strip's steady/resting state: off, or full-brightness idle_color
+    if the pot is already past the configured on/off threshold."""
     try:
         fraction = read_pot_fraction()
     except OSError:
@@ -314,7 +331,7 @@ def lerp_color(color_a, color_b, t):
     )
 
 
-def pulse(color=BASE_COLOR, base_color=PULSE_FLOOR_COLOR, stop_event=None, times=PULSE_COUNT):
+def pulse(color=None, base_color=None, stop_event=None, times=PULSE_COUNT, step_delay=None):
     """Breathe the whole strip between `base_color` (a dim floor) and `color`
     (full brightness) - it never goes fully dark.
 
@@ -323,16 +340,30 @@ def pulse(color=BASE_COLOR, base_color=PULSE_FLOOR_COLOR, stop_event=None, times
     API call and the print job itself). Otherwise pulses a fixed `times` and
     stops. Either way, leaves the strip at its normal pot-driven state (off
     or full brightness) when done.
+
+    `color`/`base_color`/`step_delay` default to None so each call reads the
+    current pulse_color/pulse_floor_color/pulse_step_delay from config.json
+    at call time - letting the web page's settings change take effect on the
+    very next pulse, without needing a default argument (which Python would
+    only ever evaluate once, at function-definition time).
     """
+    cfg = config_io.read_config()
+    if color is None:
+        color = _color(cfg["pulse_color"])
+    if base_color is None:
+        base_color = _color(cfg["pulse_floor_color"])
+    if step_delay is None:
+        step_delay = cfg["pulse_step_delay"]
+
     steps = 50
 
     def one_cycle():
         for step in range(steps + 1):          # fade up to full brightness
             set_all(lerp_color(base_color, color, step / steps))
-            time.sleep(PULSE_STEP_DELAY)
+            time.sleep(step_delay)
         for step in range(steps, -1, -1):      # fade back down to the base color
             set_all(lerp_color(base_color, color, step / steps))
-            time.sleep(PULSE_STEP_DELAY)
+            time.sleep(step_delay)
 
     if stop_event is not None:
         while not stop_event.is_set():
@@ -344,8 +375,7 @@ def pulse(color=BASE_COLOR, base_color=PULSE_FLOOR_COLOR, stop_event=None, times
     set_idle()
 
 
-def chase(color=BASE_COLOR, stop_event=None, cycles=1,
-          tail_length=CHASE_TAIL_LENGTH, step_delay=CHASE_STEP_DELAY):
+def chase(color=None, stop_event=None, cycles=1, tail_length=None, step_delay=None):
     """Comet-tail chase animation: a lit pixel with a fading tail travels
     around the strip in a loop.
 
@@ -353,7 +383,19 @@ def chase(color=BASE_COLOR, stop_event=None, cycles=1,
     held/recording" animation). Otherwise loops `cycles` full trips around
     the strip and stops. Either way, clears the strip when done - the caller
     is expected to immediately start whatever comes next (pulse or idle).
+
+    `color`/`tail_length`/`step_delay` default to None so each call reads
+    the current chase_color/chase_tail_length/chase_step_delay from
+    config.json at call time (see pulse()'s docstring for why).
     """
+    cfg = config_io.read_config()
+    if color is None:
+        color = _color(cfg["chase_color"])
+    if tail_length is None:
+        tail_length = cfg["chase_tail_length"]
+    if step_delay is None:
+        step_delay = cfg["chase_step_delay"]
+
     n = strip.numPixels()
     position = 0
     completed_cycles = 0
@@ -387,15 +429,24 @@ def print_receipt(image_path=RECEIPT_IMAGE_PATH):
     """Print a local image file directly - handy for testing the printer
     on its own, independent of the record/upload flow (see --test-image and
     status_web.py's "Test print" button). Returns True on success, False on
-    a missing file or a print failure (also logged to stderr either way)."""
+    a missing file or a print failure (also logged to stderr either way).
+
+    Applies the same FLIP_180 rotation as reflect_and_print.print_image(),
+    since this path bypasses that function entirely - without it, test
+    prints came out upside-down relative to the normal record/print flow.
+    """
     from escpos.printer import Usb
+    from PIL import Image
 
     if not os.path.isfile(image_path):
         print(f"Receipt image not found: {image_path}", file=sys.stderr)
         return False
     try:
+        image_obj = Image.open(image_path)
+        if FLIP_180:
+            image_obj = image_obj.transpose(Image.ROTATE_180)
         printer = Usb(PRINTER_VENDOR_ID, PRINTER_PRODUCT_ID, profile="default")
-        printer.image(image_path)
+        printer.image(image_obj)
         printer.cut()
         printer.close()
         return True
@@ -425,7 +476,7 @@ def wait_for_stable_state(target_pressed):
 def on_button_down(audio_path):
     """Button just went down: start the comet-tail chase animation and start recording."""
     print("Button pressed - recording...")
-    write_status(state="recording", recording_started_at=time.time())
+    write_status(state="recording", recording_started_at=time.time(), button_pressed=True)
 
     global _strip_busy
     _strip_busy = True  # pot_monitor_loop() backs off the strip until we're idle again
@@ -445,6 +496,7 @@ def on_button_up(audio_path, api_url, api_style, receipt_output):
     loop the "working" music, send the audio off, and print whatever receipt
     comes back - stopping the pulse/music once printing actually finishes."""
     print("Button released - stopping recording, pulsing LEDs, and generating receipt.")
+    write_status(button_pressed=False)
 
     # Stop the chase animation now that the button's been released.
     global _chase_stop_event, _chase_thread
@@ -570,12 +622,13 @@ def main():
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
 
-    write_status(state="starting", started_at=time.time(), api_url=args.url)
+    write_status(state="starting", started_at=time.time(), api_url=args.url, button_pressed=False)
 
     init_hardware()
 
     try:
-        set_default_levels()
+        cfg = config_io.read_config()
+        set_default_levels(mic_percent=cfg["mic_percent"], speaker_percent=cfg["speaker_percent"])
     except Exception as exc:
         # Don't let a mixer-control mismatch (see audio_io.py's MIC_CARD /
         # MIC_CAPTURE_CONTROL etc.) stop the whole script from starting.

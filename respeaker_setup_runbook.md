@@ -253,13 +253,16 @@ sudo systemctl disable button-printer.service   # stop it from running at boot
 
 ## 11. Status dashboard (HDMI console) + LAN web page
 
-Three scripts work together here: `status_io.py` (shared status file,
-imported by the others - nothing to run directly), `status_display.py`
-(full-screen dashboard for an attached monitor), and `status_web.py` (LAN
-page with a couple of action buttons). `button_neopixel_printer.py` writes
-`status.json` next to itself on every state change; the other two just read
-it, so they work independently of whether the main script is currently
-running.
+Several scripts work together here: `status_io.py` (shared *status* file,
+imported by the others - nothing to run directly), `config_io.py` (shared
+*settings* file - LED colors/timing, pot threshold, audio levels - also not
+run directly), `status_display.py` (full-screen dashboard for an attached
+monitor), and `status_web.py` (LAN page with status + controls).
+`button_neopixel_printer.py` writes `status.json` next to itself on every
+state change (including live button pressed/released state) and reads
+`config.json` on every chase/pulse/idle update; the other two scripts just
+read/write those files, so they work independently of whether the main
+script is currently running.
 
 ### Install the one extra dependency
 
@@ -350,17 +353,29 @@ sudo systemctl enable --now status-web.service
 ```
 
 Find the Pi's IP with `hostname -I`, then visit `http://<that IP>:8080` from
-any device on the same network. The page shows state/pot level/last
-print/last error, and has "Test print" and "Restart service" buttons.
+any device on the same network. The page shows state/button/pot level/last
+print/last error, and has:
+
+- **Test print** / **Play last recording** / **Restart service** buttons.
+- An **LED colors & timing** form (idle/chase/pulse/pulse-floor colors,
+  chase/pulse step timing, pot on/off threshold) that writes to
+  `config.json` - `button_neopixel_printer.py` picks up changes live, no
+  restart needed. "Reset to defaults" deletes `config.json`.
+- An **audio levels** form (mic record level, speaker volume) that applies
+  immediately via `amixer` and also saves to `config.json`, so it's the
+  default again on the next boot.
 
 ### Gotchas
 
 - **Runs as root, same as the other two:** `status-web.py`'s "Restart
-  service" button shells out to `systemctl restart`, and "Test print" opens
-  the USB printer directly - both need root, hence `User=root` again here.
+  service" button shells out to `systemctl restart`, "Test print"/"Play last
+  recording" open the USB printer/speaker directly, and the settings forms
+  write `config.json` in this project's folder - all need root, hence
+  `User=root` again here.
 - **No authentication on the web page.** Anyone on the same network segment
-  can hit those buttons. Fine for a trusted home/lab LAN; don't port-forward
-  this or expose it beyond that without adding some.
+  can hit those buttons or change LED/audio settings. Fine for a trusted
+  home/lab LAN; don't port-forward this or expose it beyond that without
+  adding some.
 - **`getty@tty1` vs `status-display`:** both want exclusive control of
   `/dev/tty1`. Disabling `getty@tty1.service` before enabling
   `status-display.service` is what avoids them fighting over it.
