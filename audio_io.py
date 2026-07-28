@@ -41,7 +41,7 @@ SAMPLE_FORMAT = "S16_LE"
 # given Pi's card exposes different control names, find them with:
 #   amixer -c <card name> scontrols
 MIC_CARD = "seeed2micvoicec"
-MIC_CAPTURE_CONTROL = "Capture"
+MIC_CAPTURE_CONTROL = "PGA"
 MIC_CAPTURE_LEVEL = 40  # percent; matches the level used in the runbook
 
 SPEAKER_CARD = "UACDemoV10"
