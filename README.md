@@ -19,8 +19,9 @@ do that first. This README covers how to run each script.
 | `pi_printer_wifi.py` | Polls a laptop's local server for print jobs over Wi-Fi | No |
 | `escpos_test.py` | Printer-only diagnostic tool (no mic/button involved) | No |
 | `status_io.py` | Shared status-file helper (imported by the three below, not run directly) | No |
+| `config_io.py` | Shared settings-file helper (LED colors/timing, pot threshold, audio levels) | No |
 | `status_display.py` | Full-screen status dashboard, meant for the Pi's HDMI console | Yes |
-| `status_web.py` | LAN-accessible status page with test-print/restart buttons | Yes |
+| `status_web.py` | LAN-accessible status page with test-print/restart/settings controls | Yes |
 
 ---
 
@@ -73,6 +74,14 @@ file): `LED_COUNT` (38), `LED_PIN` (GPIO12), `ADS1015_I2C_ADDRESS` (`0x48`),
 threshold the button's pull-up voltage and normalize the pot reading),
 `PRINTER_VENDOR_ID`/`PRINTER_PRODUCT_ID` (`0x0483`/`0x5743`, the "bt_large"
 80mm printer).
+
+NeoPixel colors, chase/pulse timing, the pot on/off threshold, and mic/
+speaker levels are *not* hardcoded constants anymore - they live in
+`config.json` (via `config_io.py`) and are read fresh on every chase/pulse/
+idle update, so changes made from the web page's settings form (see below)
+take effect live, without restarting this script. If `config.json` doesn't
+exist yet, `config_io.DEFAULTS` supplies the same values this script always
+shipped with.
 
 ---
 
@@ -194,11 +203,11 @@ Named profiles in `PRINTERS`: `bt_small` (58mm), `bt_large` (80mm, the one
 ## `status_display.py` / `status_web.py` (status dashboard + LAN page)
 
 `button_neopixel_printer.py` writes its current state (idle/recording/
-generating/printing), pot level, last print time/style, and last error to
-`status.json` (via `status_io.py`) on every state change. These two scripts
-just read that file — neither touches GPIO/I2C, so they're safe to run
-alongside the main script, or even if it's not running (they'll just show
-"no status yet").
+generating/printing), pot level, button pressed/released, last print
+time/style, and last error to `status.json` (via `status_io.py`) on every
+state change. These two scripts just read that file — neither touches
+GPIO/I2C, so they're safe to run alongside the main script, or even if it's
+not running (they'll just show "no status yet").
 
 ```bash
 # Full-screen terminal dashboard, refreshes once a second
@@ -211,11 +220,33 @@ python3 status_web.py --host 0.0.0.0 --port 9000
 
 `status_display.py` is meant to run on the Pi's HDMI console via systemd
 (no keyboard/login needed) — see the runbook's section 11 for that setup,
-plus the `status-web.service` unit for the web page. The web page also has
-"Test print" (reprints the last-generated receipt, or the static test image
-if there isn't one yet) and "Restart service" buttons — both need root,
-which is why `status_web.py` also runs as root under systemd. There's no
-authentication on the page, so it's meant for a trusted home/lab LAN only.
+plus the `status-web.service` unit for the web page. Both dashboards now
+also show the button's live pressed/released state alongside the pot level.
+
+The web page (light theme: white/tan background, yellow accents) has:
+
+- **Test print** — reprints the last-generated receipt, or the static test
+  image if there isn't one yet.
+- **Play last recording** — plays `recording.m4a` (the most recent
+  button-hold capture) out the USB speaker, in the background so the page
+  doesn't hang while it plays.
+- **Restart service** — restarts `button-printer.service`.
+- **LED colors & timing** — a form to change the idle/chase/pulse/pulse-floor
+  colors, the chase and pulse step timing, and the potentiometer on/off
+  threshold. Saves to `config.json` (via `config_io.py`); `button_neopixel_
+  printer.py` reads it live, so changes apply without restarting the main
+  service. "Reset to defaults" clears `config.json` back to the built-in
+  values.
+- **Audio levels** — sliders for mic record level and speaker volume. Applied
+  immediately via `amixer`, and persisted to `config.json` so the level also
+  becomes the new default the next time `button_neopixel_printer.py` starts
+  (e.g. after a reboot).
+
+Test print, restart, and settings changes all need root (GPIO/systemctl/USB
+access), which is why `status_web.py` also runs as root under systemd.
+There's no authentication on the page, so it's meant for a trusted home/lab
+LAN only — anyone who can reach the port can change LED colors, audio
+levels, or restart the service.
 
 Requires Flask: `sudo pip3 install flask --break-system-packages`
 

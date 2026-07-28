@@ -20,6 +20,7 @@ now it also runs standalone as a CLI for testing.
 """
 
 import argparse
+import re
 import signal
 import subprocess
 import sys
@@ -66,6 +67,23 @@ def set_alsa_volume(card, control, percent):
     cmd = ["amixer", "-c", card, "sset", control, f"{percent}%"]
     print(f"Setting {card} '{control}' to {percent}%")
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+
+
+def get_alsa_volume(card, control):
+    """Return an ALSA mixer control's current level as a 0-100 int, or None
+    if it can't be read/parsed. Equivalent to reading the `[NN%]` out of:
+
+        amixer -c <card> sget <control>
+    """
+    try:
+        result = subprocess.run(
+            ["amixer", "-c", card, "sget", control],
+            check=True, capture_output=True, text=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    match = re.search(r"\[(\d+)%\]", result.stdout)
+    return int(match.group(1)) if match else None
 
 
 def set_default_levels(mic_percent=MIC_CAPTURE_LEVEL, speaker_percent=SPEAKER_LEVEL):
@@ -129,6 +147,27 @@ def start_looping_playback(path, device=SPEAKER_DEVICE):
         "-f", "alsa", device,
     ]
     print(f"Looping playback: {path} -> {device}")
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def play_audio_file(path, device=SPEAKER_DEVICE, block=True):
+    """Play an audio file (m4a, mp3, wav, etc.) through `device` once via
+    ffmpeg -- unlike play_audio(), this isn't limited to WAV, so it works
+    directly on the m4a recordings from start_recording_m4a().
+
+    If `block` is True (default), waits for playback to finish and raises
+    on failure. If False, returns the running Popen immediately (e.g. so a
+    web request handler doesn't hang for the length of the recording) --
+    pass it to stop_playback() to cut it off early if needed.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(path)
+    cmd = ["ffmpeg", "-y", "-i", str(path), "-f", "alsa", device]
+    print(f"Playing {path} -> {device}")
+    if block:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return None
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
