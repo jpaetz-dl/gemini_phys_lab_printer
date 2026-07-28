@@ -75,6 +75,12 @@ threshold the button's pull-up voltage and normalize the pot reading),
 `PRINTER_VENDOR_ID`/`PRINTER_PRODUCT_ID` (`0x0483`/`0x5743`, the "bt_large"
 80mm printer).
 
+The NeoPixel strip is SK6812 RGBW (4 bytes/pixel, with a dedicated white
+LED) - `LED_STRIP_TYPE` at the top of the file tells rpi_ws281x to talk to
+it as such (`ws.SK6812_STRIP_GRBW`). If you swap in a plain 3-byte RGB
+strip, or colors come out in the wrong order (e.g. red/green swapped) on a
+different RGBW strip, that's the constant to change.
+
 NeoPixel colors, chase/pulse timing, the pot on/off threshold, and mic/
 speaker levels are *not* hardcoded constants anymore - they live in
 `config.json` (via `config_io.py`) and are read fresh on every chase/pulse/
@@ -232,11 +238,13 @@ The web page (light theme: white/tan background, yellow accents) has:
   doesn't hang while it plays.
 - **Restart service** — restarts `button-printer.service`.
 - **LED colors & timing** — a form to change the idle/chase/pulse/pulse-floor
-  colors, the chase and pulse step timing, and the potentiometer on/off
-  threshold. Saves to `config.json` (via `config_io.py`); `button_neopixel_
-  printer.py` reads it live, so changes apply without restarting the main
-  service. "Reset to defaults" clears `config.json` back to the built-in
-  values.
+  colors, each with its own white-channel slider (the SK6812 strip's
+  dedicated White LED, layered on top of the color picker's RGB value for a
+  warmer glow — defaults to 0/off), the chase and pulse step timing, and the
+  potentiometer on/off threshold. Saves to `config.json` (via `config_io.py`,
+  colors stored as `[r, g, b, w]`); `button_neopixel_printer.py` reads it
+  live, so changes apply without restarting the main service. "Reset to
+  defaults" clears `config.json` back to the built-in values.
 - **Audio levels** — sliders for mic record level and speaker volume. Applied
   immediately via `amixer`, and persisted to `config.json` so the level also
   becomes the new default the next time `button_neopixel_printer.py` starts
