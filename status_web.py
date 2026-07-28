@@ -485,7 +485,13 @@ def main():
                          help="Host to bind (default: 0.0.0.0, i.e. all interfaces)")
     parser.add_argument("--port", type=int, default=8080, help="Port to listen on (default: 8080)")
     args = parser.parse_args()
-    app.run(host=args.host, port=args.port)
+    # threaded=True matters: Flask's dev server is single-threaded by
+    # default, so one slow/blocking request (e.g. "Test print" hitting a USB
+    # printer that isn't responding) would otherwise freeze every other
+    # request too - including the page's own auto-refresh - making the
+    # whole dashboard look hung until that one request finally times out or
+    # returns. With threading on, a stuck request only blocks itself.
+    app.run(host=args.host, port=args.port, threaded=True)
 
 
 if __name__ == "__main__":

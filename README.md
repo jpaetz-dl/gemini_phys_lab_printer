@@ -64,6 +64,19 @@ sudo python3 button_neopixel_printer.py --style pencilSketch
 sudo python3 button_neopixel_printer.py --test-image testReceipt_01_80mm.png
 ```
 
+The button/pot ADC reads and the main press/release loop are both resilient
+to transient I2C glitches now: a failed read fails safe (button reads as
+"released", the loop logs and resets to idle) instead of raising and taking
+the whole process down. Before this fix, an I2C hiccup during a button poll
+could crash the script entirely - LEDs frozen at whatever they last showed,
+pot/button unresponsive - until systemd restarted it (or gave up, if the
+glitch was persistent enough to exceed the restart-burst limit). The
+dashboards themselves can't cause this - they're separate processes that
+only ever read/write the shared `status.json`/`config.json` files - but a
+frozen main script does stop updating `status.json`, which is what makes
+the dashboards *look* frozen too (they're accurately showing stale data,
+not hung themselves).
+
 Ctrl+C stops it cleanly (clears the NeoPixels and stops the pot-monitor
 thread; if you interrupt mid-recording it also stops ffmpeg gracefully
 rather than leaving a corrupt file).

@@ -254,8 +254,28 @@ def init_adc():
 
 def is_button_pressed():
     """True if the button is pressed - the pull-up reads near ADC_VCC when
-    open, and gets pulled down toward 0V when the button is held."""
-    return read_voltage(button_channel) < BUTTON_PRESSED_VOLTAGE_THRESHOLD
+    open, and gets pulled down toward 0V when the button is held.
+
+    read_voltage() already retries a few times internally on OSError (I2C
+    glitches), but if a glitch outlasts those retries this used to let the
+    OSError propagate straight up out of wait_for_stable_state()'s debounce
+    loop and main()'s bare `while True:` - completely unhandled, which
+    crashed the whole script. Unlike pot_monitor_loop() (its own thread,
+    already wrapped in a try/except OSError), this runs in the main thread
+    where main()'s button/print loop lives, so that crash took the entire
+    program down - LEDs frozen at whatever they last showed, pot no longer
+    doing anything, button presses no longer registering, until systemd's
+    Restart=on-failure kicked in (and if the bus stayed glitchy, eventually
+    gave up after its restart-burst limit). Failing safe here (assume
+    "released" - the pull-up's normal resting state - and let the next poll
+    try again) keeps a transient glitch from being able to take the process
+    down at all.
+    """
+    try:
+        return read_voltage(button_channel) < BUTTON_PRESSED_VOLTAGE_THRESHOLD
+    except OSError as exc:
+        print(f"Button read failed, assuming released: {exc}", file=sys.stderr)
+        return False
 
 
 def read_pot_fraction():
@@ -670,14 +690,36 @@ def main():
     print("Ready. Press and hold the button to record, release to send + print "
           "(Ctrl+C to quit)...")
 
+    global _strip_busy
     while True:
-        wait_for_stable_state(True)
-        on_button_down(args.audio_output)
+        try:
+            wait_for_stable_state(True)
+            on_button_down(args.audio_output)
 
-        wait_for_stable_state(False)
-        on_button_up(args.audio_output, args.url, args.style, args.receipt_output)
+            wait_for_stable_state(False)
+            on_button_up(args.audio_output, args.url, args.style, args.receipt_output)
 
-        time.sleep(POST_RELEASE_GUARD_SECONDS)
+            time.sleep(POST_RELEASE_GUARD_SECONDS)
+        except Exception as exc:
+            # Belt-and-suspenders: is_button_pressed() already fails safe on
+            # I2C glitches instead of raising, and on_button_up() already
+            # catches its own network/print errors, so this is a backstop
+            # for anything else unanticipated - it should rarely if ever
+            # fire. The goal is simply that NOTHING here can take the whole
+            # process down; whatever broke, log it, force everything back to
+            # a clean idle state, and keep going rather than crashing (which
+            # would freeze the LEDs and stop responding to the button/pot
+            # until systemd restarts it).
+            print(f"Unexpected error in main loop, recovering: {exc}", file=sys.stderr)
+            write_status(state="idle", last_error=str(exc), last_error_time=time.time())
+            if _chase_stop_event is not None:
+                _chase_stop_event.set()
+            if _chase_thread is not None and _chase_thread.is_alive():
+                _chase_thread.join(timeout=2)
+            _strip_busy = False
+            clear_strip()
+            set_idle()
+            time.sleep(1)
 
 
 if __name__ == "__main__":
