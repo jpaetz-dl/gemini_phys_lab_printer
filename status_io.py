@@ -21,7 +21,9 @@ STATUS_PATH = Path(__file__).with_name("status.json")
 
 # button_neopixel_printer.py calls write_status() from more than one thread
 # at once - the main thread (button press/release, cleanup) and
-# pot_monitor_loop()'s background thread (every POT_POLL_INTERVAL_SECONDS).
+# pot_monitor_loop()'s background thread (every
+# POT_STATUS_WRITE_INTERVAL_SECONDS - deliberately throttled well below its
+# much faster pot-read/LED-update rate, see that constant's comment).
 # Without this lock, two overlapping calls could both write to the *same*
 # fixed ".json.tmp" path and then both try to rename it: whichever renames
 # first succeeds and the file is gone, so the second call's tmp_path.replace()

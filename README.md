@@ -113,6 +113,21 @@ momentary contact can cause - those spikes vanish on the very next read, so
 the median (outvoted by the normal readings on either side) throws them out
 without meaningfully slowing down a real, sustained turn of the pot.
 
+The pot read + LED brightness update runs on its own fast loop
+(`POT_LED_UPDATE_INTERVAL_SECONDS`, default 0.05s) so turning the pot feels
+responsive - but writing `status.json` (for the dashboards) and re-reading
+`config.json` (for live settings changes) are throttled to a separate,
+slower interval (`POT_STATUS_WRITE_INTERVAL_SECONDS` /
+`POT_CONFIG_RELOAD_INTERVAL_SECONDS`, both 0.5s by default) rather than
+running at that same fast rate. Neither the dashboards (which poll
+`status.json` every 1.5s) nor a settings-form submission (rare, by a
+person) need faster than that, so tying them to the fast loop would just be
+wasted disk I/O and journal log spam every time someone wants the LEDs to
+feel snappier. `write_status()`/`write_config()` are also thread-safe now
+(a lock in `status_io.py`/`config_io.py`), so raising the LED update rate
+further is safe either way - it just won't make the dashboards update any
+faster, since that's governed by the separate, slower interval.
+
 ---
 
 ## `audio_io.py`

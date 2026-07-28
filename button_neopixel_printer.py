@@ -150,7 +150,26 @@ ADC_READ_RETRY_DELAY = 0.05  # seconds between retries
 # snapping straight from off to on. pot_monitor_loop() checks this
 # continuously (whenever the strip isn't busy with a press/pulse), so it
 # updates live as you turn the pot or change the range from the web page.
-POT_POLL_INTERVAL_SECONDS = 0.05
+#
+# pot_monitor_loop() runs three different-cost things on every tick: an I2C
+# pot read + LED color update (cheap - just a register read and a
+# NeoPixel strip.show()), a status.json write (disk I/O), and a config.json
+# re-read (disk I/O). Only the first one benefits from running fast - that's
+# what makes turning the pot feel responsive. The other two are throttled to
+# their own slower interval instead of running at the same rate:
+# status_web.py's dashboard only polls status.json once every 1.5s anyway
+# (see its live-status JS), so writing it out 20x/second the moment
+# POT_LED_UPDATE_INTERVAL_SECONDS got turned down for responsiveness would
+# just be needless disk I/O (SD card wear) and journal log spam for no one
+# to see; config.json changes only when someone submits the web settings
+# form, which is rare, so re-reading it at the same slower cadence is still
+# plenty responsive. This also means a faster POT_LED_UPDATE_INTERVAL_SECONDS
+# no longer multiplies how often write_status() gets called (write_status()
+# is thread-safe either way now - see status_io.py - but there's no reason
+# to hammer the disk just because the LED update rate went up).
+POT_LED_UPDATE_INTERVAL_SECONDS = 0.05
+POT_STATUS_WRITE_INTERVAL_SECONDS = 0.5
+POT_CONFIG_RELOAD_INTERVAL_SECONDS = 0.5
 
 # Occasional single-sample pot reads spike toward ADC_VCC and then vanish on
 # the very next read - a potentiometer wiper momentarily losing contact
@@ -359,29 +378,44 @@ def idle_color_for_pot(fraction, cfg=None):
 
 
 def pot_monitor_loop():
-    """Print the pot's position periodically, and - whenever the strip isn't
-    busy with a press/pulse - keep the idle resting color in sync with it."""
+    """Keep the idle LED color in sync with the pot at a fast, responsive
+    rate (POT_LED_UPDATE_INTERVAL_SECONDS) - whenever the strip isn't busy
+    with a press/pulse. status.json and config.json are only touched every
+    POT_STATUS_WRITE_INTERVAL_SECONDS / POT_CONFIG_RELOAD_INTERVAL_SECONDS
+    respectively - see the constants above for why those run slower."""
+    cfg = config_io.read_config()
+    next_config_reload = time.monotonic()
+    next_status_write = time.monotonic()
+
     while not _pot_stop_event.is_set():
+        now = time.monotonic()
         try:
-            cfg = config_io.read_config()
+            if now >= next_config_reload:
+                cfg = config_io.read_config()
+                next_config_reload = now + POT_CONFIG_RELOAD_INTERVAL_SECONDS
+
             fraction = read_pot_fraction()
             brightness = strip_brightness_for_pot(
                 fraction, cfg["pot_dim_start_fraction"], cfg["pot_full_fraction"])
-            print(f"Pot: {fraction * ADC_VCC:.2f}V ({fraction * 100:.0f}%) "
-                  f"-> strip brightness {brightness * 100:.0f}%")
-            write_status(
-                pot_fraction=round(fraction, 3),
-                pot_voltage=round(fraction * ADC_VCC, 2),
-                strip_on=brightness > 0,
-                strip_brightness_percent=round(brightness * 100),
-            )
+
             if not _strip_busy:
                 set_all(idle_color_for_pot(fraction, cfg=cfg))
+
+            if now >= next_status_write:
+                print(f"Pot: {fraction * ADC_VCC:.2f}V ({fraction * 100:.0f}%) "
+                      f"-> strip brightness {brightness * 100:.0f}%")
+                write_status(
+                    pot_fraction=round(fraction, 3),
+                    pot_voltage=round(fraction * ADC_VCC, 2),
+                    strip_on=brightness > 0,
+                    strip_brightness_percent=round(brightness * 100),
+                )
+                next_status_write = now + POT_STATUS_WRITE_INTERVAL_SECONDS
         except OSError as exc:
             # Retries in read_voltage() were already exhausted - log and keep
             # the thread alive rather than dying on a transient I2C glitch.
             print(f"Pot read failed, will retry: {exc}", file=sys.stderr)
-        _pot_stop_event.wait(POT_POLL_INTERVAL_SECONDS)
+        _pot_stop_event.wait(POT_LED_UPDATE_INTERVAL_SECONDS)
 
 
 def clear_strip():

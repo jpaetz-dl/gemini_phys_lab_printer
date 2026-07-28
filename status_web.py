@@ -30,9 +30,10 @@ additionally exposes:
     percent / pot_full_percent - the strip is off below the first, full
     brightness at/above the second, and fades linearly in between rather
     than snapping on) - all written to config.json via config_io.py, which
-    button_neopixel_printer.py reads live (no restart needed - takes effect
-    on the next chase/pulse/idle update, usually within
-    POT_POLL_INTERVAL_SECONDS).
+    button_neopixel_printer.py reads live (no restart needed - the idle/pot
+    fields take effect within POT_CONFIG_RELOAD_INTERVAL_SECONDS; chase/
+    pulse colors and timing take effect on the very next chase/pulse since
+    those are read fresh on every call).
   - An audio levels form for mic capture / speaker playback volume - applies
     immediately via amixer AND persists to config.json, so it also becomes
     the default the next time button_neopixel_printer.py starts (e.g. on
