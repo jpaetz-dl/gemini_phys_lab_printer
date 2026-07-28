@@ -67,6 +67,11 @@ DEFAULTS = {
     # Mic capture / speaker playback levels, 0-100 percent (amixer).
     "mic_percent": 40,
     "speaker_percent": 40,
+
+    # Which physical mic to record from: "respeaker" (ReSpeaker 2-Mics HAT,
+    # normal setup) or "lav" (USB lavalier mic, fallback if the HAT ever acts
+    # up again). See audio_io.py's MIC_INPUTS/mic_device_for_input().
+    "mic_input": "respeaker",
 }
 
 

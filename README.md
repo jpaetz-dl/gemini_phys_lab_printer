@@ -121,6 +121,45 @@ files and never touch I2C - but a frozen or crashed main script does stop
 updating `status.json`, which is what makes the dashboards *look* frozen too
 (they're accurately showing stale data, not hung themselves).
 
+**If the bus is flaky often enough to notice** (not just an occasional
+retried glitch), the code above bounds the damage but doesn't fix the
+underlying cause - that's almost always electrical, not software. Worth
+checking, roughly in order of how common each one is:
+
+- **Wiring length/quality.** I2C isn't meant for long runs - keep SDA/SCL as
+  short as practical, and if they have to run more than ~20-30cm, use a
+  twisted pair (SDA twisted with GND, SCL twisted with GND) rather than
+  loose jumpers. Loose breadboard/jumper connections are the single most
+  common cause of intermittent I2C - reseat them if you haven't recently.
+- **Pull-up resistors.** The ADS1015 breakout usually has its own onboard
+  pull-ups, but if you've got other I2C devices on the same bus, or long
+  wires, the combined bus capacitance can get too high for the default
+  pull-up strength to drive a clean signal, especially at the Pi's default
+  clock speed. 4.7kΩ pull-ups to 3.3V on both SDA and SCL (only need one set
+  per bus, not per device) is the standard fix.
+- **Shared/insufficient power.** If the NeoPixel strip and the ADC share the
+  Pi's 5V rail (or even just a common ground with a long/thin wire), a
+  bright/fast LED update can sag the rail or inject noise right as an I2C
+  transaction is happening. Separate power injection for the LED strip
+  (with grounds still tied together) is worth trying if the wedges seem to
+  line up with LED activity.
+- **Bus speed.** The Pi's I2C clock defaults to 100kHz (or sometimes
+  400kHz depending on the overlay), which can be too fast for a noisy or
+  long bus. Lowering it is a one-line change in `/boot/firmware/config.txt`
+  (or `/boot/config.txt` on older OS images):
+  `dtparam=i2c_arm_baudrate=50000`, then reboot. Slower but more reliable.
+- **`i2cdetect -y 1`** (from `i2c-tools`, `sudo apt install i2c-tools`) is
+  the quick sanity check - run it a few times over a minute or two. The
+  ADS1015 should show up at the same address (`48`) every time; if it
+  sometimes doesn't appear, or the command itself hangs, that's the bus
+  being unhappy independent of anything this script is doing, which points
+  more toward wiring/power than a driver quirk.
+
+None of this is needed for the script to stay stable now (that's what the
+timeout/retry logic above is for) - it's only worth chasing if you want the
+*occasional retried glitch* to stop happening at all, rather than just being
+handled gracefully when it does.
+
 Ctrl+C stops it cleanly (clears the NeoPixels and stops the pot-monitor
 thread; if you interrupt mid-recording it also stops ffmpeg gracefully
 rather than leaving a corrupt file).
@@ -242,6 +281,23 @@ control(s), if any, failed, and both `button_neopixel_printer.py`'s startup
 and the web page's "Apply audio levels" form report those individually
 instead of one all-or-nothing error.
 
+**Switching mic input (ReSpeaker vs. USB lav mic).** The Audio levels card
+on the web dashboard has a "Mic input" dropdown - pick "USB lav mic" if the
+ReSpeaker HAT ever acts up again and you want a working fallback without
+editing code. It's stored as `mic_input` (`"respeaker"` or `"lav"`) in
+`config.json`, and `on_button_down()` in `button_neopixel_printer.py` reads
+it fresh on every button press (via `audio_io.mic_device_for_input()`), so
+switching takes effect on the very next recording, no restart needed. Unlike
+the volume sliders this doesn't touch `amixer` at all - it just changes
+which ALSA device string gets passed to `arecord`.
+
+The lav mic's ALSA device name (`LAV_MIC_DEVICE` in `audio_io.py`) is an
+**unconfirmed placeholder** (`plughw:CARD=Device,DEV=0`) - USB mic card
+names/numbers can shift depending on what's plugged in and in what order.
+Before relying on it, plug the lav mic in and run `python3 audio_io.py
+diagnose` - it prints the lav mic's real `CARD=` name under "Recording
+devices" - and update `LAV_MIC_DEVICE` to match if it's different.
+
 ---
 
 ## `reflect_and_print.py`
@@ -362,7 +418,11 @@ The web page has:
 - **Audio levels** — sliders for mic record level and speaker volume. Applied
   immediately via `amixer`, and persisted to `config.json` so the level also
   becomes the new default the next time `button_neopixel_printer.py` starts
-  (e.g. after a reboot).
+  (e.g. after a reboot). Same card also has a **Mic input** dropdown
+  (ReSpeaker HAT / USB lav mic fallback) — that one's config-only (no
+  `amixer` call involved) and takes effect on the next button press; see
+  the `audio_io.py` section above for the caveat about confirming the lav
+  mic's actual ALSA device name first.
 
 Test print, restart, and settings changes all need root (GPIO/systemctl/USB
 access), which is why `status_web.py` also runs as root under systemd.

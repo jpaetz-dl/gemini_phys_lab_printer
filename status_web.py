@@ -37,7 +37,10 @@ additionally exposes:
   - An audio levels form for mic capture / speaker playback volume - applies
     immediately via amixer AND persists to config.json, so it also becomes
     the default the next time button_neopixel_printer.py starts (e.g. on
-    boot).
+    boot). The same form also has a "Mic input" dropdown (ReSpeaker HAT vs.
+    USB lav mic fallback) - that one's config.json-only (no amixer call,
+    button_neopixel_printer.py just reads it fresh on the next button press
+    via audio_io.mic_device_for_input()).
 
 Runs as its own systemd service (status-web.service), separate from
 button-printer.service, so restarting the main service doesn't take the web
@@ -79,6 +82,8 @@ from audio_io import (
     SPEAKER_CARD,
     SPEAKER_CONTROL,
     SPEAKER_DEVICE,
+    MIC_INPUTS,
+    MIC_INPUT_LABELS,
 )
 
 app = Flask(__name__)
@@ -271,8 +276,15 @@ PAGE_TEMPLATE = """<!doctype html>
             <output id="speaker_out" name="speaker_out" for="speaker_percent">{speaker_percent}</output>
           </div>
         </div>
+        <div class="field">
+          <label for="mic_input">Mic input</label>
+          <select id="mic_input" name="mic_input">
+            {mic_input_options_html}
+          </select>
+          <span class="sublabel">Switch to the USB lav mic if the ReSpeaker HAT ever acts up again.</span>
+        </div>
       </div>
-      <input type="submit" value="Apply audio levels">
+      <input type="submit" value="Apply audio settings">
     </form>
   </div>
 
@@ -395,6 +407,16 @@ def white_channel(rgba):
     return rgba[3] if len(rgba) > 3 else 0
 
 
+def render_mic_input_options(cfg):
+    selected = cfg.get("mic_input", "respeaker")
+    parts = []
+    for key in MIC_INPUTS:
+        label = MIC_INPUT_LABELS.get(key, key)
+        sel = " selected" if key == selected else ""
+        parts.append(f'<option value="{key}"{sel}>{label}</option>')
+    return "\n            ".join(parts)
+
+
 def render_color_fields(cfg):
     parts = []
     for key, label in COLOR_FIELDS:
@@ -493,6 +515,7 @@ def render_page(message=None):
         pot_full_percent=round(cfg["pot_full_fraction"] * 100),
         mic_percent=mic_percent,
         speaker_percent=speaker_percent,
+        mic_input_options_html=render_mic_input_options(cfg),
     )
 
 
@@ -580,6 +603,9 @@ def save_audio_levels():
     try:
         mic_percent = max(0, min(100, int(request.form["mic_percent"])))
         speaker_percent = max(0, min(100, int(request.form["speaker_percent"])))
+        mic_input = request.form.get("mic_input", "respeaker")
+        if mic_input not in MIC_INPUTS:
+            raise ValueError(f"Unknown mic input: {mic_input!r}")
     except (KeyError, ValueError) as exc:
         return redirect(url_for("index", message=f"Couldn't apply audio levels: {exc}"))
 
@@ -601,8 +627,12 @@ def save_audio_levels():
     # they're what should take effect on the next restart/boot too, and
     # keeping the user's last-requested settings visible is more useful than
     # silently reverting the form to old values after a partial failure.
-    config_io.write_config(mic_percent=mic_percent, speaker_percent=speaker_percent)
+    # mic_input doesn't go through amixer at all (it's read by
+    # button_neopixel_printer.py's on_button_down() at the moment of
+    # recording), so it always "applies" here - just persist it.
+    config_io.write_config(mic_percent=mic_percent, speaker_percent=speaker_percent, mic_input=mic_input)
 
+    parts.append(f"mic input: {MIC_INPUT_LABELS.get(mic_input, mic_input)}")
     message = "Audio levels: " + ", ".join(parts)
     if errors:
         message += " - run `python3 audio_io.py diagnose` on the Pi to check control names."

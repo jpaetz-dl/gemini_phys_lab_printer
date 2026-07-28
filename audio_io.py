@@ -30,6 +30,40 @@ from pathlib import Path
 RESPEAKER_DEVICE = "plughw:CARD=seeed2micvoicec,DEV=0"  # mic input (2 channels)
 SPEAKER_DEVICE = "plughw:CARD=UACDemoV10,DEV=0"  # USB speaker output
 
+# Fallback mic input: a USB lavalier mic, for if the ReSpeaker HAT ever acts
+# up again (I2S/driver flakiness, needs a reseat, etc.) and you want to swap
+# inputs without editing code. UNCONFIRMED placeholder card name below - the
+# lav mic's actual `CARD=` value depends on what `arecord -l` shows it as on
+# this Pi (it showed up as card 1 during troubleshooting, but USB card
+# numbers/names can shift depending on what's plugged in and in what order).
+# Run `python3 audio_io.py diagnose` with the lav mic plugged in, find its
+# entry under "Recording devices (arecord -l)", and update this to match -
+# e.g. plughw:CARD=Device,DEV=0 or similar.
+LAV_MIC_DEVICE = "plughw:CARD=Device,DEV=0"
+
+# Selectable mic inputs, keyed by the config.json "mic_input" value - lets
+# the dashboard offer a dropdown instead of requiring a code change to swap
+# mics. mic_device_for_input() below is the single place that resolves a
+# key to an actual ALSA device string; anything reading mic_input from
+# config should go through it rather than re-implementing the lookup.
+MIC_INPUTS = {
+    "respeaker": RESPEAKER_DEVICE,
+    "lav": LAV_MIC_DEVICE,
+}
+MIC_INPUT_LABELS = {
+    "respeaker": "ReSpeaker 2-Mics HAT",
+    "lav": "USB lav mic (fallback)",
+}
+DEFAULT_MIC_INPUT = "respeaker"
+
+
+def mic_device_for_input(mic_input):
+    """Resolve a config.json "mic_input" key ("respeaker"/"lav") to an ALSA
+    device string. Falls back to RESPEAKER_DEVICE for an unknown/missing key
+    (e.g. an older config.json saved before this setting existed) rather than
+    raising, so a stale or malformed value can't stop recording outright."""
+    return MIC_INPUTS.get(mic_input, RESPEAKER_DEVICE)
+
 # --- Recording defaults ---
 SAMPLE_RATE = 16000
 CHANNELS = 2
@@ -160,6 +194,10 @@ def diagnose_audio():
     print("=== Configured control names (audio_io.py constants) ===")
     print(f"  MIC_CARD={MIC_CARD!r}  MIC_CAPTURE_CONTROL={MIC_CAPTURE_CONTROL!r}")
     print(f"  SPEAKER_CARD={SPEAKER_CARD!r}  SPEAKER_CONTROL={SPEAKER_CONTROL!r}")
+    print(f"  RESPEAKER_DEVICE={RESPEAKER_DEVICE!r}")
+    print(f"  LAV_MIC_DEVICE={LAV_MIC_DEVICE!r}  <- confirm this against the")
+    print("    'Recording devices' list above if you're switching to the lav mic;")
+    print("    it's an unconfirmed placeholder until you check it here.")
     print()
     print("If a card is missing entirely from the arecord -l/aplay -l output above,")
     print("that's a driver/overlay/USB problem, not a mixer setting - check")

@@ -75,7 +75,6 @@ import adafruit_ads1x15.ads1015 as ADS
 from adafruit_ads1x15.analog_in import AnalogIn
 
 from audio_io import (
-    RESPEAKER_DEVICE,
     SAMPLE_RATE,
     CHANNELS,
     SPEAKER_DEVICE,
@@ -85,6 +84,7 @@ from audio_io import (
     stop_playback,
     upload_audio,
     set_default_levels,
+    mic_device_for_input,
 )
 from reflect_and_print import extract_image, print_image, FLIP_180
 from status_io import write_status
@@ -736,9 +736,15 @@ def on_button_down(audio_path):
     _chase_thread = threading.Thread(target=chase, kwargs={"stop_event": _chase_stop_event}, daemon=True)
     _chase_thread.start()
 
+    # Read fresh (not a module-level default) so switching "Mic input" on the
+    # dashboard takes effect on the very next press, no restart needed - same
+    # live-reload approach used for colors/timing elsewhere in this file.
+    cfg = config_io.read_config()
+    mic_device = mic_device_for_input(cfg.get("mic_input", "respeaker"))
+
     global _active_recording_proc
     _active_recording_proc = start_recording_m4a(
-        audio_path, device=RESPEAKER_DEVICE, rate=SAMPLE_RATE, channels=CHANNELS)
+        audio_path, device=mic_device, rate=SAMPLE_RATE, channels=CHANNELS)
 
 
 def on_button_up(audio_path, api_url, api_style, receipt_output):
