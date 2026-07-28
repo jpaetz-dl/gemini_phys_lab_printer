@@ -150,7 +150,7 @@ ADC_READ_RETRY_DELAY = 0.05  # seconds between retries
 # snapping straight from off to on. pot_monitor_loop() checks this
 # continuously (whenever the strip isn't busy with a press/pulse), so it
 # updates live as you turn the pot or change the range from the web page.
-POT_POLL_INTERVAL_SECONDS = 0.5
+POT_POLL_INTERVAL_SECONDS = 0.05
 
 # Occasional single-sample pot reads spike toward ADC_VCC and then vanish on
 # the very next read - a potentiometer wiper momentarily losing contact
