@@ -143,6 +143,17 @@ BUTTON_PRESSED_VOLTAGE_THRESHOLD = ADC_VCC / 2  # below this = pressed (pulled t
 ADC_READ_RETRIES = 3
 ADC_READ_RETRY_DELAY = 0.05  # seconds between retries
 
+# Hard per-attempt wall-clock cap on an I2C read (see
+# _read_channel_voltage_with_timeout()) - a genuinely wedged bus can make
+# the underlying smbus call block forever instead of raising OSError, which
+# ADC_READ_RETRIES/ADC_READ_RETRY_DELAY alone can't do anything about (they
+# only kick in once a call actually returns/raises). 0.2s is generous next
+# to a normal ADS1015 read (well under a few ms), so it won't false-trigger
+# under normal system load, but still bounds the worst case - with 3
+# retries, read_voltage() gives up and fails safe within ~0.7s even if the
+# bus is completely stuck, instead of freezing forever.
+ADC_READ_TIMEOUT_SECONDS = 0.2
+
 # Potentiometer dim-in range (config_io: "pot_dim_start_fraction" /
 # "pot_full_fraction") - at/below the start fraction the strip is off;
 # at/above the full fraction it's full-brightness idle_color; in between,
@@ -262,14 +273,60 @@ _chase_thread = None
 _chase_stop_event = None
 
 
-def read_voltage(channel, retries=ADC_READ_RETRIES, retry_delay=ADC_READ_RETRY_DELAY):
+def _read_channel_voltage_with_timeout(channel, timeout):
+    """Read channel.voltage with a hard wall-clock timeout, by running the
+    read in a fresh, disposable daemon thread rather than the calling
+    thread.
+
+    A loose wire or I2C noise raises OSError promptly, which the retry loop
+    in read_voltage() already handled - but a genuinely wedged I2C bus
+    (electrical fault holding SDA/SCL, a stuck device) can make the
+    underlying smbus call block *forever* instead of raising anything. That
+    happened: with no timeout, is_button_pressed() (main thread) and
+    read_pot_fraction() (pot_monitor_loop's thread) both hung on their next
+    I2C read to the same physically-stuck ADS1015/bus - freezing button
+    handling and LED updates at the same time, with no exception for
+    anything to catch and no crash for systemd's Restart=on-failure to act
+    on. The two dashboards kept running fine throughout (they never touch
+    I2C), just showing status.json exactly as it was the instant the main
+    process froze - which is why they showed no error.
+
+    Running the read in a throwaway thread and join()-ing it with a timeout
+    is the only way to bound that: if the thread doesn't finish in time, we
+    give up and move on. The abandoned thread may itself stay blocked
+    forever if the bus never recovers (Python can't force-cancel a thread
+    stuck in a C-level call) - that's an acceptable trade for a slowly
+    leaking daemon thread over freezing the entire script. If the bus does
+    recover, subsequent reads work normally again with no restart needed.
+    """
+    result = {}
+
+    def _read():
+        try:
+            result["value"] = channel.voltage
+        except Exception as exc:  # noqa: BLE001 - re-raised as-is on the caller's side below
+            result["error"] = exc
+
+    thread = threading.Thread(target=_read, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise OSError(f"I2C read timed out after {timeout}s (bus may be stuck)")
+    if "error" in result:
+        raise result["error"]
+    return result["value"]
+
+
+def read_voltage(channel, retries=ADC_READ_RETRIES, retry_delay=ADC_READ_RETRY_DELAY,
+                  timeout=ADC_READ_TIMEOUT_SECONDS):
     """Read an AnalogIn channel's voltage, retrying briefly on OSError (loose
-    wire, I2C noise) instead of letting one bad read take down a thread or
-    the whole script."""
+    wire, I2C noise) or a timeout (wedged bus - see
+    _read_channel_voltage_with_timeout()) instead of letting one bad read
+    take down - or freeze - a thread or the whole script."""
     last_exc = None
     for attempt in range(retries):
         try:
-            return channel.voltage
+            return _read_channel_voltage_with_timeout(channel, timeout)
         except OSError as exc:
             last_exc = exc
             if attempt < retries - 1:

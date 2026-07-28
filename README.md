@@ -65,17 +65,33 @@ sudo python3 button_neopixel_printer.py --test-image testReceipt_01_80mm.png
 ```
 
 The button/pot ADC reads and the main press/release loop are both resilient
-to transient I2C glitches now: a failed read fails safe (button reads as
-"released", the loop logs and resets to idle) instead of raising and taking
-the whole process down. Before this fix, an I2C hiccup during a button poll
-could crash the script entirely - LEDs frozen at whatever they last showed,
-pot/button unresponsive - until systemd restarted it (or gave up, if the
-glitch was persistent enough to exceed the restart-burst limit). The
-dashboards themselves can't cause this - they're separate processes that
-only ever read/write the shared `status.json`/`config.json` files - but a
-frozen main script does stop updating `status.json`, which is what makes
-the dashboards *look* frozen too (they're accurately showing stale data,
-not hung themselves).
+to I2C problems now, covering two different failure modes:
+
+- **A quick-raising glitch** (loose wire, electrical noise) - `read_voltage()`
+  retries a couple times (`ADC_READ_RETRIES`/`ADC_READ_RETRY_DELAY`), and a
+  failed read fails safe (button reads as "released", the loop logs and
+  resets to idle) instead of raising and taking the whole process down. This
+  used to be able to crash the script entirely - LEDs frozen at whatever
+  they last showed, pot/button unresponsive - until systemd restarted it (or
+  gave up, if the glitch was persistent enough to exceed the restart-burst
+  limit).
+- **A genuinely wedged bus** (an electrical fault holding SDA/SCL, a stuck
+  device) - this doesn't raise anything, it makes the underlying smbus call
+  block *forever*, which no amount of retrying-on-exception can catch since
+  nothing ever returns or raises. `read_voltage()` now runs each attempt in
+  a disposable thread with a hard timeout (`ADC_READ_TIMEOUT_SECONDS`,
+  0.2s) instead of calling `channel.voltage` directly, so a truly stuck bus
+  now fails the same way a quick glitch does (bounded, logged, safe) instead
+  of freezing the button-polling loop and the pot-monitor thread forever -
+  both of which share the same I2C bus, so a wedge affects both LEDs and the
+  button at the same time. If the bus recovers, subsequent reads pick back
+  up automatically - no restart needed.
+
+The dashboards themselves can't cause either of these - they're separate
+processes that only ever read/write the shared `status.json`/`config.json`
+files and never touch I2C - but a frozen or crashed main script does stop
+updating `status.json`, which is what makes the dashboards *look* frozen too
+(they're accurately showing stale data, not hung themselves).
 
 Ctrl+C stops it cleanly (clears the NeoPixels and stops the pot-monitor
 thread; if you interrupt mid-recording it also stops ffmpeg gracefully
