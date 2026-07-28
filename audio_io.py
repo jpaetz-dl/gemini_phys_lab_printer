@@ -37,10 +37,14 @@ SAMPLE_FORMAT = "S16_LE"
 
 # --- Mixer levels (set via `amixer`, same tool alsamixer uses under the hood) ---
 # Card names here match the CARD= part of RESPEAKER_DEVICE/SPEAKER_DEVICE above,
-# not the full device string. Control names ("Capture", "PCM") come from what
-# alsamixer showed during setup (respeaker_setup_runbook.md step 5) -- if a
-# given Pi's card exposes different control names, find them with:
-#   amixer -c <card name> scontrols
+# not the full device string. Control names come from what alsamixer/amixer
+# showed on this Pi at some point (respeaker_setup_runbook.md step 5) -- but
+# these can be wrong for a different driver version, a different overlay, or
+# even the same HAT after a firmware/driver update, and amixer errors out
+# ("Unable to find simple control") if the name doesn't match. If mic/speaker
+# levels aren't taking effect, run `python3 audio_io.py diagnose` first - it
+# prints every control each card actually has (`amixer scontrols`/`contents`)
+# so you can confirm these names against reality instead of guessing.
 MIC_CARD = "seeed2micvoicec"
 MIC_CAPTURE_CONTROL = "PGA"
 MIC_CAPTURE_LEVEL = 40  # percent; matches the level used in the runbook
@@ -91,9 +95,77 @@ def set_default_levels(mic_percent=MIC_CAPTURE_LEVEL, speaker_percent=SPEAKER_LE
     configured defaults. Meant to be called once at startup (e.g. from
     button_neopixel_printer.py's main(), or this module's own `levels`
     CLI command) so levels don't depend on whatever alsamixer was last
-    left at."""
-    set_alsa_volume(MIC_CARD, MIC_CAPTURE_CONTROL, mic_percent)
-    set_alsa_volume(SPEAKER_CARD, SPEAKER_CONTROL, speaker_percent)
+    left at.
+
+    The mic and speaker are set independently, each in its own try/except -
+    previously a single subprocess.run(check=True) failure (e.g.
+    MIC_CAPTURE_CONTROL not matching this card's actual control name) would
+    raise straight out of this function, which meant the *speaker* line
+    right after it never even ran. That looked exactly like "both mic and
+    speaker levels are wrong" even though only the mic control name was
+    actually bad - a single bad control should never be able to take the
+    other one down with it.
+
+    Returns a list of (label, exception) pairs for whichever control(s)
+    failed to set (empty list if both succeeded), so callers can report
+    real per-control status instead of an all-or-nothing outcome.
+    """
+    errors = []
+    try:
+        set_alsa_volume(MIC_CARD, MIC_CAPTURE_CONTROL, mic_percent)
+    except subprocess.CalledProcessError as exc:
+        errors.append(("mic", exc))
+    try:
+        set_alsa_volume(SPEAKER_CARD, SPEAKER_CONTROL, speaker_percent)
+    except subprocess.CalledProcessError as exc:
+        errors.append(("speaker", exc))
+    return errors
+
+
+def diagnose_audio():
+    """Print ALSA card/mixer diagnostics for the mic and speaker - purely
+    informational, doesn't change anything. Run this first when audio isn't
+    working (`python3 audio_io.py diagnose`) and share the output: it shows
+    whether each card is even still detected under its expected name, and
+    every mixer control each one actually has (including mute switches),
+    so a wrong/stale MIC_CAPTURE_CONTROL or SPEAKER_CONTROL name - or an
+    unexpectedly muted control neither of those constants covers - shows up
+    directly instead of being guessed at.
+    """
+
+    def run(cmd):
+        print(f"$ {' '.join(cmd)}")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            output = (result.stdout + result.stderr).strip()
+            print(output if output else "(no output)")
+        except FileNotFoundError:
+            print(f"  '{cmd[0]}' not found - is it installed?")
+        except subprocess.TimeoutExpired:
+            print(f"  '{cmd[0]}' timed out")
+        print()
+
+    print("=== Recording devices (arecord -l) ===")
+    run(["arecord", "-l"])
+    print("=== Playback devices (aplay -l) ===")
+    run(["aplay", "-l"])
+    print(f"=== Mixer controls on '{MIC_CARD}' (mic) ===")
+    run(["amixer", "-c", MIC_CARD, "scontrols"])
+    print(f"=== Full mixer state on '{MIC_CARD}' (mic) - look for mute/off flags ===")
+    run(["amixer", "-c", MIC_CARD, "contents"])
+    print(f"=== Mixer controls on '{SPEAKER_CARD}' (speaker) ===")
+    run(["amixer", "-c", SPEAKER_CARD, "scontrols"])
+    print(f"=== Full mixer state on '{SPEAKER_CARD}' (speaker) - look for mute/off flags ===")
+    run(["amixer", "-c", SPEAKER_CARD, "contents"])
+    print("=== Configured control names (audio_io.py constants) ===")
+    print(f"  MIC_CARD={MIC_CARD!r}  MIC_CAPTURE_CONTROL={MIC_CAPTURE_CONTROL!r}")
+    print(f"  SPEAKER_CARD={SPEAKER_CARD!r}  SPEAKER_CONTROL={SPEAKER_CONTROL!r}")
+    print()
+    print("If a card is missing entirely from the arecord -l/aplay -l output above,")
+    print("that's a driver/overlay/USB problem, not a mixer setting - check")
+    print("respeaker_setup_runbook.md sections 3-4. If the card is present but its")
+    print("scontrols list doesn't include the control name shown above, that's the")
+    print("mismatch to fix (update MIC_CAPTURE_CONTROL/SPEAKER_CONTROL here).")
 
 
 def record_audio(output_path, duration=5, device=RESPEAKER_DEVICE,
@@ -334,6 +406,9 @@ def main():
     levels.add_argument("--speaker-percent", type=int, default=SPEAKER_LEVEL,
                          help=f"Speaker playback level, 0-100 (default: {SPEAKER_LEVEL})")
 
+    sub.add_parser("diagnose", help="Print ALSA card/mixer diagnostics (read-only) - "
+                                     "run this first when audio isn't working")
+
     args = parser.parse_args()
 
     try:
@@ -348,7 +423,15 @@ def main():
             record_and_send(args.output, duration=args.duration,
                              device=args.device, url=args.url)
         elif args.command == "levels":
-            set_default_levels(mic_percent=args.mic_percent, speaker_percent=args.speaker_percent)
+            errors = set_default_levels(mic_percent=args.mic_percent, speaker_percent=args.speaker_percent)
+            if errors:
+                for label, exc in errors:
+                    print(f"  {label}: FAILED - {exc}", file=sys.stderr)
+                print("Run `python3 audio_io.py diagnose` to see the actual control "
+                      "names available on each card.", file=sys.stderr)
+                sys.exit(1)
+        elif args.command == "diagnose":
+            diagnose_audio()
     except subprocess.CalledProcessError as e:
         print(f"Command failed: {e}", file=sys.stderr)
         sys.exit(1)

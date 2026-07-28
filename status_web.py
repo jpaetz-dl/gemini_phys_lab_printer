@@ -71,7 +71,7 @@ from button_neopixel_printer import (
 )
 from audio_io import (
     play_audio_file,
-    set_alsa_volume,
+    set_default_levels,
     get_alsa_volume,
     MIC_CARD,
     MIC_CAPTURE_CONTROL,
@@ -579,14 +579,32 @@ def save_audio_levels():
     try:
         mic_percent = max(0, min(100, int(request.form["mic_percent"])))
         speaker_percent = max(0, min(100, int(request.form["speaker_percent"])))
+    except (KeyError, ValueError) as exc:
+        return redirect(url_for("index", message=f"Couldn't apply audio levels: {exc}"))
 
-        set_alsa_volume(MIC_CARD, MIC_CAPTURE_CONTROL, mic_percent)
-        set_alsa_volume(SPEAKER_CARD, SPEAKER_CONTROL, speaker_percent)
-        config_io.write_config(mic_percent=mic_percent, speaker_percent=speaker_percent)
+    # set_default_levels() sets the mic and speaker independently - a bad
+    # control name on one (e.g. MIC_CAPTURE_CONTROL not matching this card's
+    # actual controls) can no longer silently prevent the other from being
+    # applied, which is what made "both mic and speaker are wrong" such a
+    # confusing symptom before. Report per-control results here instead of
+    # a single all-or-nothing message.
+    errors = set_default_levels(mic_percent=mic_percent, speaker_percent=speaker_percent)
+    failed = {label for label, _exc in errors}
+    parts = []
+    parts.append(f"mic {mic_percent}%" if "mic" not in failed else f"mic FAILED (see journal)")
+    parts.append(f"speaker {speaker_percent}%" if "speaker" not in failed else f"speaker FAILED (see journal)")
+    for label, exc in errors:
+        print(f"Couldn't set {label} level: {exc}")
 
-        message = f"Audio levels applied (mic {mic_percent}%, speaker {speaker_percent}%)."
-    except (KeyError, ValueError, subprocess.CalledProcessError) as exc:
-        message = f"Couldn't apply audio levels: {exc}"
+    # Persist the requested values regardless of whether they applied live -
+    # they're what should take effect on the next restart/boot too, and
+    # keeping the user's last-requested settings visible is more useful than
+    # silently reverting the form to old values after a partial failure.
+    config_io.write_config(mic_percent=mic_percent, speaker_percent=speaker_percent)
+
+    message = "Audio levels: " + ", ".join(parts)
+    if errors:
+        message += " - run `python3 audio_io.py diagnose` on the Pi to check control names."
     return redirect(url_for("index", message=message))
 
 

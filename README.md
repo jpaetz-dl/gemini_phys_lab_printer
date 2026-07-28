@@ -119,7 +119,7 @@ without meaningfully slowing down a real, sustained turn of the pot.
 
 Low-level mic/speaker utility — this is what `button_neopixel_printer.py` and
 `reflect_and_print.py` build on, and it's also useful standalone for testing
-the ReSpeaker/speaker independently. Five subcommands:
+the ReSpeaker/speaker independently. Six subcommands:
 
 ```bash
 # Record 5s (default) to a WAV file
@@ -141,6 +141,10 @@ python3 audio_io.py reflect -o reflection.webm -d 10 --url http://10.18.44.99:50
 # Set mic capture / speaker playback volume (via amixer)
 python3 audio_io.py levels
 python3 audio_io.py levels --mic-percent 60 --speaker-percent 70
+
+# Print ALSA card/mixer diagnostics (read-only) - run this first if
+# recording/playback stops working
+python3 audio_io.py diagnose
 ```
 
 | Subcommand | Flags |
@@ -150,6 +154,7 @@ python3 audio_io.py levels --mic-percent 60 --speaker-percent 70
 | `test` | `-o/--output` (default `test_recording.wav`), `-d/--duration`, `--in-device`, `--out-device` |
 | `reflect` | `-o/--output` (default `reflection.webm`), `-d/--duration` (default 10s), `--device`, `--url` |
 | `levels` | `--mic-percent` (default 40), `--speaker-percent` (default 40) |
+| `diagnose` | none - prints `arecord -l`/`aplay -l` and full `amixer scontrols`/`contents` for both cards |
 
 Note: the press-and-hold recording in `button_neopixel_printer.py` uses
 `start_recording_m4a()`/`stop_recording()` from this module directly (not
@@ -161,8 +166,22 @@ startup, so mic/speaker volume gets (re-)set every time that script runs —
 including on boot, since it's the one running under systemd (see the runbook's
 section 10). Card names/control names (`MIC_CARD`, `MIC_CAPTURE_CONTROL`,
 `SPEAKER_CARD`, `SPEAKER_CONTROL`) are constants at the top of `audio_io.py` —
-if a Pi's card exposes different control names, find the right ones with
-`amixer -c <card name> scontrols`.
+if a Pi's card exposes different control names (or a driver/overlay update
+changes them out from under you), `python3 audio_io.py diagnose` prints every
+control each card actually has, to check against those constants directly
+instead of guessing.
+
+The mic and speaker are always set as two independent calls now, each with
+its own error handling - a bad/stale control name on one can't silently
+prevent the other from being applied too. Previously they were two calls in
+a row with no isolation between them, so a single failing mic control name
+(e.g. after a driver update renamed it) would raise and skip the speaker
+line right after it - which looked exactly like "both mic and speaker
+volume are wrong" even though only one of the two control names was
+actually bad. `set_default_levels()` now returns a list of which
+control(s), if any, failed, and both `button_neopixel_printer.py`'s startup
+and the web page's "Apply audio levels" form report those individually
+instead of one all-or-nothing error.
 
 ---
 

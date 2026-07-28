@@ -729,7 +729,14 @@ def main():
 
     try:
         cfg = config_io.read_config()
-        set_default_levels(mic_percent=cfg["mic_percent"], speaker_percent=cfg["speaker_percent"])
+        # set_default_levels() already isolates the mic/speaker calls from
+        # each other (a bad control name on one used to raise and skip the
+        # other entirely, silently leaving both wrong) and returns whichever
+        # one(s) failed instead of raising.
+        level_errors = set_default_levels(mic_percent=cfg["mic_percent"], speaker_percent=cfg["speaker_percent"])
+        for label, level_exc in level_errors:
+            print(f"Couldn't set {label} level - run `python3 audio_io.py diagnose` "
+                  f"to check control names: {level_exc}", file=sys.stderr)
     except Exception as exc:
         # Don't let a mixer-control mismatch (see audio_io.py's MIC_CARD /
         # MIC_CAPTURE_CONTROL etc.) stop the whole script from starting.
