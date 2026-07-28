@@ -105,7 +105,9 @@ def render(status, ip_address):
     if "pot_fraction" in status:
         pct = status["pot_fraction"] * 100
         voltage = status.get("pot_voltage", 0.0)
-        strip_state = "ON" if status.get("strip_on") else "off"
+        brightness = status.get("strip_brightness_percent")
+        strip_state = f"{brightness}% brightness" if brightness is not None else \
+            ("ON" if status.get("strip_on") else "off")
         lines.append(f"  Pot level:    {pct:.0f}%  ({voltage:.2f}V)  -> strip {strip_state}")
 
     if "button_pressed" in status:

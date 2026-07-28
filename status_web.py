@@ -26,10 +26,13 @@ additionally exposes:
   - A settings form for the NeoPixel colors (idle/chase/pulse/pulse floor),
     each with its own white-channel slider (the SK6812 strip's dedicated
     White LED, layered on top of the RGB color for a warmer glow), plus
-    chase/pulse timing and the potentiometer on/off threshold - all written
-    to config.json via config_io.py, which button_neopixel_printer.py reads
-    live (no restart needed - takes effect on the next chase/pulse/idle
-    update, usually within POT_POLL_INTERVAL_SECONDS).
+    chase/pulse timing and the potentiometer dim-in range (pot_dim_start_
+    percent / pot_full_percent - the strip is off below the first, full
+    brightness at/above the second, and fades linearly in between rather
+    than snapping on) - all written to config.json via config_io.py, which
+    button_neopixel_printer.py reads live (no restart needed - takes effect
+    on the next chase/pulse/idle update, usually within
+    POT_POLL_INTERVAL_SECONDS).
   - An audio levels form for mic capture / speaker playback volume - applies
     immediately via amixer AND persists to config.json, so it also becomes
     the default the next time button_neopixel_printer.py starts (e.g. on
@@ -232,11 +235,15 @@ PAGE_TEMPLATE = """<!doctype html>
           <input type="number" id="pulse_step_delay" name="pulse_step_delay" step="0.005" min="0.001" max="0.5" value="{pulse_step_delay}">
         </div>
         <div class="field">
-          <label for="pot_on_threshold_percent">Pot on/off threshold (%)</label>
-          <input type="number" id="pot_on_threshold_percent" name="pot_on_threshold_percent" step="1" min="0" max="100" value="{pot_on_threshold_percent}">
+          <label for="pot_dim_start_percent">Pot dim-in start (%)</label>
+          <input type="number" id="pot_dim_start_percent" name="pot_dim_start_percent" step="1" min="0" max="100" value="{pot_dim_start_percent}">
+        </div>
+        <div class="field">
+          <label for="pot_full_percent">Pot full-on (%)</label>
+          <input type="number" id="pot_full_percent" name="pot_full_percent" step="1" min="0" max="100" value="{pot_full_percent}">
         </div>
       </div>
-      <div class="hint">Below this pot % the strip stays off; at/above it, the strip goes to the idle color.</div>
+      <div class="hint">At/below "dim-in start" the strip is off; at/above "full-on" it's the full idle color; in between it fades in smoothly rather than snapping on.</div>
       <input type="submit" value="Save LED settings">
       <button type="submit" formaction="{reset_settings_url}" class="secondary"
               onclick="return confirm('Reset LED colors/timing/threshold to defaults?');">Reset to defaults</button>
@@ -300,7 +307,10 @@ PAGE_TEMPLATE = """<!doctype html>
       if (status.pot_fraction === undefined || status.pot_fraction === null) return "unknown";
       const pct = (status.pot_fraction * 100).toFixed(0);
       const v = (status.pot_voltage || 0).toFixed(2);
-      return `${{pct}}% (${{v}}V, strip ${{status.strip_on ? "ON" : "off"}})`;
+      const strip = (status.strip_brightness_percent !== undefined && status.strip_brightness_percent !== null)
+        ? `strip ${{status.strip_brightness_percent}}% brightness`
+        : (status.strip_on ? "strip ON" : "strip off");
+      return `${{pct}}% (${{v}}V, ${{strip}})`;
     }}
 
     function formatLastPrint(status) {{
@@ -420,9 +430,10 @@ def render_page(message=None):
         uptime = "unknown"
 
     if "pot_fraction" in status:
-        pot = (f"{status['pot_fraction'] * 100:.0f}% "
-               f"({status.get('pot_voltage', 0):.2f}V, strip "
-               f"{'ON' if status.get('strip_on') else 'off'})")
+        brightness = status.get("strip_brightness_percent")
+        strip_text = f"strip {brightness}% brightness" if brightness is not None else \
+            ("strip ON" if status.get("strip_on") else "strip off")
+        pot = f"{status['pot_fraction'] * 100:.0f}% ({status.get('pot_voltage', 0):.2f}V, {strip_text})"
     else:
         pot = "unknown"
 
@@ -477,7 +488,8 @@ def render_page(message=None):
         chase_step_delay=cfg["chase_step_delay"],
         chase_tail_length=cfg["chase_tail_length"],
         pulse_step_delay=cfg["pulse_step_delay"],
-        pot_on_threshold_percent=round(cfg["pot_on_threshold_fraction"] * 100),
+        pot_dim_start_percent=round(cfg["pot_dim_start_fraction"] * 100),
+        pot_full_percent=round(cfg["pot_full_fraction"] * 100),
         mic_percent=mic_percent,
         speaker_percent=speaker_percent,
     )
@@ -542,9 +554,12 @@ def save_settings():
         fields["chase_tail_length"] = max(1, int(request.form["chase_tail_length"]))
         fields["pulse_step_delay"] = max(0.001, float(request.form["pulse_step_delay"]))
 
-        pot_percent = float(request.form["pot_on_threshold_percent"])
-        pot_percent = max(0.0, min(100.0, pot_percent))
-        fields["pot_on_threshold_fraction"] = round(pot_percent / 100, 3)
+        dim_start_percent = max(0.0, min(100.0, float(request.form["pot_dim_start_percent"])))
+        full_percent = max(0.0, min(100.0, float(request.form["pot_full_percent"])))
+        if full_percent <= dim_start_percent:
+            raise ValueError('"Pot full-on" must be greater than "Pot dim-in start"')
+        fields["pot_dim_start_fraction"] = round(dim_start_percent / 100, 3)
+        fields["pot_full_fraction"] = round(full_percent / 100, 3)
 
         config_io.write_config(**fields)
         message = "LED settings saved."

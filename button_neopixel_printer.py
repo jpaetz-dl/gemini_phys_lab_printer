@@ -8,11 +8,13 @@ ADC_VCC when open, drops near 0V when pressed). A potentiometer is wired to
 A2 on the same ADS1015, for a future brightness control.
 
 The NeoPixel strip's state is driven by the potentiometer on A2 and by the
-button/print cycle. Colors, chase/pulse timing, and the pot on/off threshold
+button/print cycle. Colors, chase/pulse timing, and the pot dim-in range
 below all live in config.json (see config_io.py) so they're adjustable live
 from the web page, not hardcoded here:
-  - pot below the configured threshold (default 40%): strip off
-  - pot at/above that: strip full-brightness idle_color (default white) at rest
+  - pot at/below pot_dim_start_fraction (default 15%): strip off
+  - pot at/above pot_full_fraction (default 60%): strip full-brightness
+    idle_color (default white) at rest
+  - in between: brightness fades linearly rather than snapping on/off
   - button held: a short comet-tail chase animation in chase_color (replaces
     the old Qwiic button's onboard LED as the recording indicator)
   - button released, waiting on the receipt API and then on the print job:
@@ -60,9 +62,11 @@ run this whole script with sudo (needed anyway for the LEDs).
 import argparse
 import os
 import signal
+import statistics
 import sys
 import threading
 import time
+from collections import deque
 
 from rpi_ws281x import Color, PixelStrip, ws
 import board
@@ -139,12 +143,23 @@ BUTTON_PRESSED_VOLTAGE_THRESHOLD = ADC_VCC / 2  # below this = pressed (pulled t
 ADC_READ_RETRIES = 3
 ADC_READ_RETRY_DELAY = 0.05  # seconds between retries
 
-# Potentiometer on/off threshold (config_io: "pot_on_threshold_fraction") -
-# below it the strip stays off entirely; at/above it, the strip sits at
-# full-brightness idle_color. pot_monitor_loop() checks this continuously
-# (whenever the strip isn't busy with a press/pulse), so it updates live as
-# you turn the pot or change the threshold from the web page.
+# Potentiometer dim-in range (config_io: "pot_dim_start_fraction" /
+# "pot_full_fraction") - at/below the start fraction the strip is off;
+# at/above the full fraction it's full-brightness idle_color; in between,
+# brightness fades linearly (see strip_brightness_for_pot()) rather than
+# snapping straight from off to on. pot_monitor_loop() checks this
+# continuously (whenever the strip isn't busy with a press/pulse), so it
+# updates live as you turn the pot or change the range from the web page.
 POT_POLL_INTERVAL_SECONDS = 0.5
+
+# Occasional single-sample pot reads spike toward ADC_VCC and then vanish on
+# the very next read - a potentiometer wiper momentarily losing contact
+# (dirty track/vibration) floats toward the pull-up voltage rather than
+# reading its actual position. A rolling median over the last few raw reads
+# rejects an isolated spike like that (it's outvoted by the two normal
+# readings on either side of it) while still tracking a real, sustained turn
+# of the pot within a couple of poll intervals.
+POT_MEDIAN_WINDOW = 3
 
 # Software debounce/backstop. The mechanical switch can bounce for a few ms
 # right at the press/release transitions; requiring several consecutive
@@ -278,9 +293,27 @@ def is_button_pressed():
         return False
 
 
+# Rolling history of raw pot readings for the median filter in
+# read_pot_fraction() - module-level since there's only one pot, read from
+# both the main thread (set_idle()) and pot_monitor_loop()'s thread.
+_pot_reading_history = deque(maxlen=POT_MEDIAN_WINDOW)
+
+
 def read_pot_fraction():
-    """Potentiometer position as a 0.0-1.0 fraction of ADC_VCC."""
-    return max(0.0, min(1.0, read_voltage(pot_channel) / ADC_VCC))
+    """Potentiometer position as a 0.0-1.0 fraction of ADC_VCC, median-
+    filtered over the last POT_MEDIAN_WINDOW raw reads.
+
+    Without this, an isolated bad read (wiper losing contact for an
+    instant, floating toward ADC_VCC, then re-making contact on the very
+    next read) would flash the strip to full brightness for one poll
+    interval and then back down - the median throws out that kind of
+    single-sample spike (it's outvoted 2-to-1 by the normal readings right
+    before and after it) while a real, sustained turn of the pot still
+    shows up within a couple of poll intervals.
+    """
+    raw = max(0.0, min(1.0, read_voltage(pot_channel) / ADC_VCC))
+    _pot_reading_history.append(raw)
+    return statistics.median(_pot_reading_history)
 
 
 def _color(rgba):
@@ -296,13 +329,33 @@ def _color(rgba):
     return Color(rgba[0], rgba[1], rgba[2], w)
 
 
+def strip_brightness_for_pot(fraction, dim_start, full):
+    """0.0-1.0 brightness for the idle strip given the pot's position and
+    the configured dim-in range: 0 at/below dim_start, 1 at/above full,
+    fading linearly in between (so the strip dims in rather than snapping
+    straight from off to on)."""
+    if full <= dim_start:
+        # Degenerate/misconfigured range (e.g. someone set both the same,
+        # or full < dim_start) - fall back to a hard cutoff at dim_start
+        # rather than dividing by zero.
+        return 1.0 if fraction >= dim_start else 0.0
+    if fraction <= dim_start:
+        return 0.0
+    if fraction >= full:
+        return 1.0
+    return (fraction - dim_start) / (full - dim_start)
+
+
 def idle_color_for_pot(fraction, cfg=None):
-    """Off below the configured pot on/off threshold, full-brightness
-    idle_color at/above it. `cfg` can be passed in to reuse an
-    already-read config (e.g. from pot_monitor_loop's own loop iteration)
-    instead of hitting the filesystem again."""
+    """The strip's resting color for a given pot reading: off at/below the
+    configured dim_start fraction, full-brightness idle_color at/above the
+    full fraction, and a smooth fade (via lerp_color(), including the white
+    channel) in between. `cfg` can be passed in to reuse an already-read
+    config (e.g. from pot_monitor_loop's own loop iteration) instead of
+    hitting the filesystem again."""
     cfg = cfg or config_io.read_config()
-    return _color(cfg["idle_color"]) if fraction >= cfg["pot_on_threshold_fraction"] else OFF_COLOR
+    brightness = strip_brightness_for_pot(fraction, cfg["pot_dim_start_fraction"], cfg["pot_full_fraction"])
+    return lerp_color(OFF_COLOR, _color(cfg["idle_color"]), brightness)
 
 
 def pot_monitor_loop():
@@ -312,12 +365,15 @@ def pot_monitor_loop():
         try:
             cfg = config_io.read_config()
             fraction = read_pot_fraction()
-            strip_on = fraction >= cfg["pot_on_threshold_fraction"]
-            print(f"Pot: {fraction * ADC_VCC:.2f}V ({fraction * 100:.0f}%)")
+            brightness = strip_brightness_for_pot(
+                fraction, cfg["pot_dim_start_fraction"], cfg["pot_full_fraction"])
+            print(f"Pot: {fraction * ADC_VCC:.2f}V ({fraction * 100:.0f}%) "
+                  f"-> strip brightness {brightness * 100:.0f}%")
             write_status(
                 pot_fraction=round(fraction, 3),
                 pot_voltage=round(fraction * ADC_VCC, 2),
-                strip_on=strip_on,
+                strip_on=brightness > 0,
+                strip_brightness_percent=round(brightness * 100),
             )
             if not _strip_busy:
                 set_all(idle_color_for_pot(fraction, cfg=cfg))
@@ -337,8 +393,8 @@ def clear_strip():
 
 
 def set_idle():
-    """The strip's steady/resting state: off, or full-brightness idle_color
-    if the pot is already past the configured on/off threshold."""
+    """The strip's steady/resting state, per the pot's current position and
+    the configured dim-in range (see idle_color_for_pot())."""
     try:
         fraction = read_pot_fraction()
     except OSError:

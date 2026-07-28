@@ -4,8 +4,8 @@ config_io.py -- shared, live-reloadable settings for the button/printer rig.
 
 Same atomic read/write pattern as status_io.py, but for user-adjustable
 settings rather than live status: LED colors, chase/pulse timing, the pot
-on/off threshold, and mic/speaker levels. status_web.py's settings form
-writes here; button_neopixel_printer.py reads here.
+dim-in range, and mic/speaker levels. status_web.py's settings form writes
+here; button_neopixel_printer.py reads here.
 
 Colors are stored as [r, g, b, w] lists (JSON has no tuple/Color type) -- the
 4th value is the dedicated White LED on the SK6812 RGBW strip (separate from
@@ -47,8 +47,13 @@ DEFAULTS = {
     "chase_tail_length": 6,       # number of pixels in the comet's fading tail
     "pulse_step_delay": 0.02,     # seconds between brightness steps; lower = faster pulse
 
-    # Potentiometer on/off threshold, as a 0.0-1.0 fraction of ADC_VCC.
-    "pot_on_threshold_fraction": 0.40,
+    # Potentiometer dim-in range, as 0.0-1.0 fractions of ADC_VCC. At/below
+    # pot_dim_start_fraction the strip is off; at/above pot_full_fraction
+    # it's full-brightness idle_color; in between, brightness (including the
+    # white channel) fades linearly rather than snapping on. Replaces the
+    # old single pot_on_threshold_fraction hard on/off cutoff.
+    "pot_dim_start_fraction": 0.15,
+    "pot_full_fraction": 0.60,
 
     # Mic capture / speaker playback levels, 0-100 percent (amixer).
     "mic_percent": 40,

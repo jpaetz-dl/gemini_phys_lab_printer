@@ -19,7 +19,7 @@ do that first. This README covers how to run each script.
 | `pi_printer_wifi.py` | Polls a laptop's local server for print jobs over Wi-Fi | No |
 | `escpos_test.py` | Printer-only diagnostic tool (no mic/button involved) | No |
 | `status_io.py` | Shared status-file helper (imported by the three below, not run directly) | No |
-| `config_io.py` | Shared settings-file helper (LED colors/timing, pot threshold, audio levels) | No |
+| `config_io.py` | Shared settings-file helper (LED colors/timing, pot dim-in range, audio levels) | No |
 | `status_display.py` | Full-screen status dashboard, meant for the Pi's HDMI console | Yes |
 | `status_web.py` | LAN-accessible status page with test-print/restart/settings controls | Yes |
 
@@ -94,13 +94,24 @@ it as such (`ws.SK6812_STRIP_GRBW`). If you swap in a plain 3-byte RGB
 strip, or colors come out in the wrong order (e.g. red/green swapped) on a
 different RGBW strip, that's the constant to change.
 
-NeoPixel colors, chase/pulse timing, the pot on/off threshold, and mic/
-speaker levels are *not* hardcoded constants anymore - they live in
-`config.json` (via `config_io.py`) and are read fresh on every chase/pulse/
-idle update, so changes made from the web page's settings form (see below)
-take effect live, without restarting this script. If `config.json` doesn't
-exist yet, `config_io.DEFAULTS` supplies the same values this script always
-shipped with.
+NeoPixel colors, chase/pulse timing, the pot dim-in range, and mic/speaker
+levels are *not* hardcoded constants anymore - they live in `config.json`
+(via `config_io.py`) and are read fresh on every chase/pulse/idle update, so
+changes made from the web page's settings form (see below) take effect
+live, without restarting this script. If `config.json` doesn't exist yet,
+`config_io.DEFAULTS` supplies the same values this script always shipped
+with.
+
+The strip doesn't snap straight from off to full brightness as the pot
+turns - at/below `pot_dim_start_fraction` (default 15%) it's off, at/above
+`pot_full_fraction` (default 60%) it's full-brightness `idle_color`, and in
+between it fades in linearly (including the white channel). Raw pot reads
+are also median-filtered over the last few samples (`POT_MEDIAN_WINDOW`,
+default 3) before that dimming math runs, to reject the occasional
+single-sample spike toward `ADC_VCC` that a potentiometer wiper losing
+momentary contact can cause - those spikes vanish on the very next read, so
+the median (outvoted by the normal readings on either side) throws them out
+without meaningfully slowing down a real, sustained turn of the pot.
 
 ---
 
@@ -263,7 +274,10 @@ The web page has:
   colors, each with its own white-channel slider (the SK6812 strip's
   dedicated White LED, layered on top of the color picker's RGB value for a
   warmer glow — defaults to 0/off), the chase and pulse step timing, and the
-  potentiometer on/off threshold. Saves to `config.json` (via `config_io.py`,
+  potentiometer dim-in range ("Pot dim-in start" / "Pot full-on" — the strip
+  is off at/below the first, full brightness at/above the second, and fades
+  linearly in between; the form rejects a submission where full-on isn't
+  greater than dim-in start). Saves to `config.json` (via `config_io.py`,
   colors stored as `[r, g, b, w]`); `button_neopixel_printer.py` reads it
   live, so changes apply without restarting the main service. "Reset to
   defaults" clears `config.json` back to the built-in values.
