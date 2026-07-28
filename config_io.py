@@ -7,9 +7,13 @@ settings rather than live status: LED colors, chase/pulse timing, the pot
 on/off threshold, and mic/speaker levels. status_web.py's settings form
 writes here; button_neopixel_printer.py reads here.
 
-Colors are stored as plain [r, g, b] lists (JSON has no tuple/Color type) --
-button_neopixel_printer.py converts to rpi_ws281x Color objects at the point
-of use.
+Colors are stored as [r, g, b, w] lists (JSON has no tuple/Color type) -- the
+4th value is the dedicated White LED on the SK6812 RGBW strip (separate from
+mixing r=g=b for "white"; it's its own diode, good for a warmer glow layered
+on top of a color). button_neopixel_printer.py converts these to rpi_ws281x
+Color objects at the point of use. Old 3-element [r, g, b] entries (saved
+before the white channel was exposed) are padded with w=0 on read, so an
+existing config.json from before this change still loads fine.
 
 Important: button_neopixel_printer.py must call read_config() at each place
 it needs a color/timing/threshold value (e.g. inside pulse()/chase()/
@@ -25,12 +29,18 @@ from pathlib import Path
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
 
+# config.json keys that hold [r, g, b, w] color lists - read_config() pads
+# any of these found as an old 3-element [r, g, b] entry with w=0.
+COLOR_KEYS = ("idle_color", "chase_color", "pulse_color", "pulse_floor_color")
+
 DEFAULTS = {
-    # LED colors, as [r, g, b] (0-255 each).
-    "idle_color": [255, 255, 255],       # full-brightness idle-on color
-    "chase_color": [255, 255, 255],
-    "pulse_color": [255, 255, 255],
-    "pulse_floor_color": [15, 15, 15],   # dim floor the pulse breathes down to (never fully dark)
+    # LED colors, as [r, g, b, w] (0-255 each). w is the dedicated White LED
+    # on the SK6812 RGBW strip - defaults to 0 (off) so out-of-the-box
+    # behavior is unchanged; dial it up per-phase for a warmer glow.
+    "idle_color": [255, 255, 255, 0],       # full-brightness idle-on color
+    "chase_color": [255, 255, 255, 0],
+    "pulse_color": [255, 255, 255, 0],
+    "pulse_floor_color": [15, 15, 15, 0],   # dim floor the pulse breathes down to (never fully dark)
 
     # Animation timing.
     "chase_step_delay": 0.03,     # seconds between each step of the chase; lower = faster
@@ -55,6 +65,10 @@ def read_config():
         config.update(saved)
     except (FileNotFoundError, json.JSONDecodeError):
         pass
+    for key in COLOR_KEYS:
+        value = config.get(key)
+        if isinstance(value, list) and len(value) == 3:
+            config[key] = value + [0]  # old entry saved before the white channel existed
     return config
 
 

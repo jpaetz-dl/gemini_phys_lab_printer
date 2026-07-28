@@ -16,7 +16,9 @@ additionally exposes:
     the request returns immediately instead of blocking for the clip's
     length.
   - A settings form for the NeoPixel colors (idle/chase/pulse/pulse floor),
-    chase/pulse timing, and the potentiometer on/off threshold - all written
+    each with its own white-channel slider (the SK6812 strip's dedicated
+    White LED, layered on top of the RGB color for a warmer glow), plus
+    chase/pulse timing and the potentiometer on/off threshold - all written
     to config.json via config_io.py, which button_neopixel_printer.py reads
     live (no restart needed - takes effect on the next chase/pulse/idle
     update, usually within POT_POLL_INTERVAL_SECONDS).
@@ -166,6 +168,7 @@ PAGE_TEMPLATE = """<!doctype html>
     }}
     .field {{ display: flex; flex-direction: column; gap: 0.25rem; }}
     .field label {{ font-size: 0.85rem; color: var(--muted); }}
+    .field .sublabel {{ font-size: 0.75rem; color: var(--muted); margin-top: 0.15rem; }}
     .field input[type=color] {{ height: 2.2rem; width: 100%; border: 1px solid var(--tan-dark); border-radius: 4px; padding: 2px; }}
     .field input[type=number], .field input[type=range] {{
       padding: 0.35rem; border: 1px solid var(--tan-dark); border-radius: 4px; font-size: 0.9rem;
@@ -268,8 +271,8 @@ def format_timestamp(ts):
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
 
-def rgb_to_hex(rgb):
-    return "#{:02x}{:02x}{:02x}".format(*rgb)
+def rgb_to_hex(rgba):
+    return "#{:02x}{:02x}{:02x}".format(*rgba[:3])
 
 
 def hex_to_rgb(hex_str):
@@ -279,12 +282,28 @@ def hex_to_rgb(hex_str):
     return [int(hex_str[i:i + 2], 16) for i in (0, 2, 4)]
 
 
+def white_channel(rgba):
+    """Pull the white value out of a [r, g, b, w] config list (0 if missing -
+    old configs saved before the white channel was exposed)."""
+    return rgba[3] if len(rgba) > 3 else 0
+
+
 def render_color_fields(cfg):
     parts = []
     for key, label in COLOR_FIELDS:
+        w_id = f"{key}_w"
+        w = white_channel(cfg[key])
         parts.append(
-            f'<div class="field"><label for="{key}">{label}</label>'
-            f'<input type="color" id="{key}" name="{key}" value="{rgb_to_hex(cfg[key])}"></div>'
+            f'<div class="field">'
+            f'<label for="{key}">{label}</label>'
+            f'<input type="color" id="{key}" name="{key}" value="{rgb_to_hex(cfg[key])}">'
+            f'<div class="range-row">'
+            f'<input type="range" id="{w_id}" name="{w_id}" min="0" max="255" value="{w}" '
+            f'oninput="{w_id}_out.value = this.value">'
+            f'<output id="{w_id}_out" name="{w_id}_out" for="{w_id}">{w}</output>'
+            f'</div>'
+            f'<span class="sublabel">White channel (warm glow, 0-255)</span>'
+            f'</div>'
         )
     return "\n        ".join(parts)
 
@@ -419,7 +438,9 @@ def save_settings():
     try:
         fields = {}
         for key, _label in COLOR_FIELDS:
-            fields[key] = hex_to_rgb(request.form.get(key))
+            rgb = hex_to_rgb(request.form.get(key))
+            w = max(0, min(255, int(request.form.get(f"{key}_w", 0))))
+            fields[key] = rgb + [w]
 
         fields["chase_step_delay"] = max(0.001, float(request.form["chase_step_delay"]))
         fields["chase_tail_length"] = max(1, int(request.form["chase_tail_length"]))

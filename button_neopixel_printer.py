@@ -64,7 +64,7 @@ import sys
 import threading
 import time
 
-from rpi_ws281x import Color, PixelStrip
+from rpi_ws281x import Color, PixelStrip, ws
 import board
 import busio
 import adafruit_ads1x15.ads1015 as ADS
@@ -98,6 +98,18 @@ LED_DMA = 10            # DMA channel to use for generating signal
 LED_INVERT = False      # True to invert the signal (level shifter)
 LED_CHANNEL = 0         # PWM channel 0 for GPIO12/18
 LED_MAX_BRIGHTNESS = 255
+
+# These are SK6812 RGBW pixels (4 bytes/pixel - R, G, B, plus a dedicated
+# White LED) - not the plain 3-byte WS281x strips rpi_ws281x defaults to.
+# Without strip_type set explicitly, PixelStrip sends 3 bytes/pixel, which
+# an RGBW strip doesn't understand: each pixel ends up consuming one byte of
+# the *next* pixel's data, so colors shift/smear down the whole strip - this
+# was the "lights aren't working very well" symptom after switching to RGBW
+# hardware. GRBW is the common wire order for SK6812; if colors still come
+# out wrong (e.g. red and green swapped), try ws.SK6812_STRIP_RGBW or
+# another ws.SK6812_STRIP_*W constant instead.
+LED_STRIP_TYPE = ws.SK6812_STRIP_GRBW
+
 OFF_COLOR = Color(0, 0, 0)
 PULSE_COUNT = 3            # fallback pulse count when pulse() is run without a stop_event
 
@@ -188,7 +200,8 @@ def init_hardware():
     strip/button_channel/pot_channel."""
     global strip, i2c, ads, button_channel, pot_channel
     strip = PixelStrip(LED_COUNT, LED_PIN, LED_FREQ_HZ, LED_DMA,
-                        LED_INVERT, LED_MAX_BRIGHTNESS, LED_CHANNEL)
+                        LED_INVERT, LED_MAX_BRIGHTNESS, LED_CHANNEL,
+                        strip_type=LED_STRIP_TYPE)
     strip.begin()
 
     i2c = busio.I2C(board.SCL, board.SDA)
@@ -250,9 +263,17 @@ def read_pot_fraction():
     return max(0.0, min(1.0, read_voltage(pot_channel) / ADC_VCC))
 
 
-def _color(rgb):
-    """Convert a config.json [r, g, b] list into an rpi_ws281x Color."""
-    return Color(rgb[0], rgb[1], rgb[2])
+def _color(rgba):
+    """Convert a config.json [r, g, b, w] list into an rpi_ws281x Color.
+    `w` is the dedicated White LED on the SK6812 RGBW strip, layered on top
+    of the R/G/B mix (not a substitute for it) - dial it up per-phase in
+    config.json / the web page's settings form for a warmer glow. Accepts a
+    plain 3-element [r, g, b] too (treated as w=0), since config_io.
+    read_config() only pads old entries on the way out - callers that build
+    a color list by hand don't have to remember the 4th slot.
+    """
+    w = rgba[3] if len(rgba) > 3 else 0
+    return Color(rgba[0], rgba[1], rgba[2], w)
 
 
 def idle_color_for_pot(fraction, cfg=None):
@@ -321,13 +342,17 @@ def _color_channels(color):
 
 
 def lerp_color(color_a, color_b, t):
-    """Blend between two Colors: t=0 -> color_a, t=1 -> color_b."""
-    r1, g1, b1, _ = _color_channels(color_a)
-    r2, g2, b2, _ = _color_channels(color_b)
+    """Blend between two Colors, including the white channel: t=0 ->
+    color_a, t=1 -> color_b. Interpolating white too means the chase tail
+    and pulse breathing fade a configured warm-glow white in and out along
+    with the RGB mix, instead of it snapping on/off."""
+    r1, g1, b1, w1 = _color_channels(color_a)
+    r2, g2, b2, w2 = _color_channels(color_b)
     return Color(
         int(r1 + (r2 - r1) * t),
         int(g1 + (g2 - g1) * t),
         int(b1 + (b2 - b1) * t),
+        int(w1 + (w2 - w1) * t),
     )
 
 
