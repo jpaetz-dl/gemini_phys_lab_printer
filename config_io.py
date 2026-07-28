@@ -24,10 +24,19 @@ if a value were only ever read into a default argument.
 """
 
 import json
+import os
+import threading
 import time
 from pathlib import Path
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
+
+# Same reasoning as status_io.py's _write_lock: status_web.py runs Flask
+# with threaded=True, so two settings-form submissions arriving at once
+# would otherwise race on the same fixed ".json.tmp" path (one write_config()
+# call's rename can beat the other to the tmp file, leaving the second with
+# a FileNotFoundError) or silently lose one submission's changes.
+_write_lock = threading.Lock()
 
 # config.json keys that hold [r, g, b, w] color lists - read_config() pads
 # any of these found as an old 3-element [r, g, b] entry with w=0.
@@ -79,17 +88,19 @@ def read_config():
 
 def write_config(**fields):
     """Merge `fields` into config.json, writing atomically (tmp file +
-    rename) so a reader never sees a half-written file."""
-    current = {}
-    try:
-        current = json.loads(CONFIG_PATH.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
-    current.update(fields)
-    current["updated_at"] = time.time()
-    tmp_path = CONFIG_PATH.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(current, indent=2))
-    tmp_path.replace(CONFIG_PATH)
+    rename) so a reader never sees a half-written file. Thread-safe (see
+    _write_lock above)."""
+    with _write_lock:
+        current = {}
+        try:
+            current = json.loads(CONFIG_PATH.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        current.update(fields)
+        current["updated_at"] = time.time()
+        tmp_path = CONFIG_PATH.with_suffix(f".{os.getpid()}.{threading.get_ident()}.json.tmp")
+        tmp_path.write_text(json.dumps(current, indent=2))
+        tmp_path.replace(CONFIG_PATH)
 
 
 def reset_config():
