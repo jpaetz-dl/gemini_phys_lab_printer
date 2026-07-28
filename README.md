@@ -260,6 +260,24 @@ Requires Flask: `sudo pip3 install flask --break-system-packages`
 
 ---
 
+## `reload_services.sh`
+
+Restarts the three systemd services (`button-printer.service`,
+`status-display.service`, `status-web.service`) without rebooting the whole
+Pi — handy while iterating, since editing a `.py` file doesn't take effect
+until the service running it restarts.
+
+```bash
+./reload_services.sh              # restart all three
+./reload_services.sh web          # just status-web.service
+./reload_services.sh main display # just those two
+```
+
+Needs root (same as the services themselves) — it re-execs itself with
+`sudo` automatically if you don't run it with sudo already. Skips any
+service that isn't installed yet on that particular Pi rather than failing,
+and prints an active/not-active summary at the end.
+
 ## Dependencies
 
 See [`respeaker_setup_runbook.md`](respeaker_setup_runbook.md#8-install-dependencies-for-the-button--neopixel--printer-scripts)
