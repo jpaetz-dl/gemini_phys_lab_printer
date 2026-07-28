@@ -242,7 +242,16 @@ python3 status_web.py --host 0.0.0.0 --port 9000
 plus the `status-web.service` unit for the web page. Both dashboards now
 also show the button's live pressed/released state alongside the pot level.
 
-The web page (light theme: white/tan background, yellow accents) has:
+The web page (light theme: white/tan background, yellow accents) refreshes
+its Status card every ~1.5s via a small JS polling loop against
+`/status.json` - not a full-page reload. That used to be a `<meta refresh>`
+every 10s, which had two problems: it wasn't very "live," and it would wipe
+out anything you were mid-edit in the settings/audio forms below, since the
+whole page (including form inputs) got re-rendered from scratch on every
+reload. The JS-only approach only ever touches the Status card's own DOM
+nodes, so the forms are untouched unless you actually submit them.
+
+The web page has:
 
 - **Test print** — reprints the last-generated receipt, or the static test
   image if there isn't one yet.

@@ -11,6 +11,14 @@ additionally exposes:
     this script never calls - it only uses print_receipt(), which just
     talks to the USB printer directly.
   - "Restart service" - runs `systemctl restart button-printer.service`.
+  - The Status card refreshes itself every ~1.5s via a small JS polling loop
+    against /status.json, rather than a `<meta refresh>` full-page reload.
+    That matters for two reasons: a full-page reload only happened every 10s
+    (not very "live"), and - worse - it would blow away anything you were
+    mid-edit in the settings/audio forms below, since the whole page
+    (including form inputs) got re-rendered from scratch on every reload.
+    JS-only polling only ever touches the Status card's own DOM nodes, so
+    the forms are untouched unless you actually submit them.
   - "Play last recording" - plays AUDIO_OUTPUT_PATH (recording.m4a) out the
     USB speaker, via audio_io.play_audio_file(), in a background thread so
     the request returns immediately instead of blocking for the clip's
@@ -94,7 +102,6 @@ PAGE_TEMPLATE = """<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="refresh" content="10">
   <title>Gemini Phys Lab Printer</title>
   <style>
     :root {{
@@ -183,15 +190,15 @@ PAGE_TEMPLATE = """<!doctype html>
   {message_html}
 
   <div class="card">
-    <h2>Status</h2>
+    <h2>Status <span id="live-indicator" class="sublabel" style="font-weight:normal"></span></h2>
     <table>
-      <tr><td class="label">State</td><td class="state {state_class}">{state}</td></tr>
-      <tr><td class="label">Button</td><td class="{button_class}">{button_text}</td></tr>
-      <tr><td class="label">Uptime</td><td>{uptime}</td></tr>
-      <tr><td class="label">Pot level</td><td>{pot}</td></tr>
-      <tr><td class="label">Last print</td><td>{last_print}</td></tr>
-      <tr><td class="label">Last API response</td><td>{last_api}</td></tr>
-      <tr><td class="label">Last error</td><td class="{error_class}">{last_error}</td></tr>
+      <tr><td class="label">State</td><td id="state-value" class="state {state_class}">{state}</td></tr>
+      <tr><td class="label">Button</td><td id="button-value" class="{button_class}">{button_text}</td></tr>
+      <tr><td class="label">Uptime</td><td id="uptime-value">{uptime}</td></tr>
+      <tr><td class="label">Pot level</td><td id="pot-value">{pot}</td></tr>
+      <tr><td class="label">Last print</td><td id="last-print-value">{last_print}</td></tr>
+      <tr><td class="label">Last API response</td><td id="last-api-value">{last_api}</td></tr>
+      <tr><td class="label">Last error</td><td id="last-error-value" class="{error_class}">{last_error}</td></tr>
     </table>
 
     <form method="post" action="{test_print_url}" style="display:inline">
@@ -260,6 +267,95 @@ PAGE_TEMPLATE = """<!doctype html>
       <input type="submit" value="Apply audio levels">
     </form>
   </div>
+
+  <script>
+    // Polls /status.json and patches only the Status card's own cells - the
+    // page never does a full reload, so the settings/audio forms below are
+    // never touched (and never wiped out) while you're mid-edit in them.
+    // See the module docstring for why a <meta refresh> used to do exactly
+    // that.
+    const STATE_CSS_CLASS = {{
+      idle: "state-idle", recording: "state-recording", generating: "state-generating",
+      printing: "state-printing", stopped: "state-stopped", starting: "state-starting",
+    }};
+
+    function pad(n) {{ return String(n).padStart(2, "0"); }}
+
+    function formatTimestamp(ts) {{
+      if (!ts) return "never";
+      const d = new Date(ts * 1000);
+      return `${{d.getFullYear()}}-${{pad(d.getMonth() + 1)}}-${{pad(d.getDate())}} `
+           + `${{pad(d.getHours())}}:${{pad(d.getMinutes())}}:${{pad(d.getSeconds())}}`;
+    }}
+
+    function formatUptime(startedAt) {{
+      if (!startedAt) return "unknown";
+      let s = Math.floor(Date.now() / 1000 - startedAt);
+      const h = Math.floor(s / 3600); s -= h * 3600;
+      const m = Math.floor(s / 60); s -= m * 60;
+      return h ? `${{h}}h ${{m}}m ${{s}}s` : `${{m}}m ${{s}}s`;
+    }}
+
+    function formatPot(status) {{
+      if (status.pot_fraction === undefined || status.pot_fraction === null) return "unknown";
+      const pct = (status.pot_fraction * 100).toFixed(0);
+      const v = (status.pot_voltage || 0).toFixed(2);
+      return `${{pct}}% (${{v}}V, strip ${{status.strip_on ? "ON" : "off"}})`;
+    }}
+
+    function formatLastPrint(status) {{
+      let s = formatTimestamp(status.last_print_time);
+      if (status.last_print_style) s += ` (style: ${{status.last_print_style}})`;
+      return s;
+    }}
+
+    function formatLastApi(status) {{
+      const v = status.last_api_response_seconds;
+      return (v === undefined || v === null) ? "-" : `${{v.toFixed(2)}}s`;
+    }}
+
+    function setText(id, text) {{ document.getElementById(id).textContent = text; }}
+
+    function pollStatus() {{
+      fetch("/status.json", {{ cache: "no-store" }})
+        .then((r) => r.json())
+        .then((status) => {{
+          const state = status.state || "unknown";
+          const stateEl = document.getElementById("state-value");
+          stateEl.textContent = state;
+          stateEl.className = "state " + (STATE_CSS_CLASS[state] || "");
+
+          const buttonEl = document.getElementById("button-value");
+          if (status.button_pressed === undefined || status.button_pressed === null) {{
+            buttonEl.textContent = "unknown"; buttonEl.className = "";
+          }} else if (status.button_pressed) {{
+            buttonEl.textContent = "PRESSED"; buttonEl.className = "button-pressed";
+          }} else {{
+            buttonEl.textContent = "released"; buttonEl.className = "button-released";
+          }}
+
+          setText("uptime-value", formatUptime(status.started_at));
+          setText("pot-value", formatPot(status));
+          setText("last-print-value", formatLastPrint(status));
+          setText("last-api-value", formatLastApi(status));
+
+          const errorEl = document.getElementById("last-error-value");
+          if (status.last_error) {{
+            errorEl.textContent = status.last_error; errorEl.className = "error";
+          }} else {{
+            errorEl.textContent = "none"; errorEl.className = "";
+          }}
+
+          document.getElementById("live-indicator").textContent = "";
+        }})
+        .catch(() => {{
+          document.getElementById("live-indicator").textContent = "(connection lost - retrying)";
+        }});
+    }}
+
+    pollStatus();
+    setInterval(pollStatus, 1500);
+  </script>
 </body>
 </html>
 """
