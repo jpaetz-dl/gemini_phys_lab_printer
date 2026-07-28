@@ -61,6 +61,7 @@ run this whole script with sudo (needed anyway for the LEDs).
 
 import argparse
 import os
+import queue
 import signal
 import statistics
 import sys
@@ -273,106 +274,111 @@ _chase_thread = None
 _chase_stop_event = None
 
 
-class _InFlightRead:
-    """A minimal, manually-implemented stand-in for a concurrent.futures
-    Future, backed by a single plain `threading.Thread(daemon=True)`.
+class _I2CWorker:
+    """A single, permanent, daemon background thread that owns *all* access
+    to the shared ADS1015/I2C bus - both the button channel (read from the
+    main thread, via wait_for_stable_state()'s tight polling loop) and the
+    pot channel (read from pot_monitor_loop()'s background thread).
 
-    This is deliberately NOT concurrent.futures.ThreadPoolExecutor. That
-    was the second version of this fix, and it introduced a *worse* bug:
-    ThreadPoolExecutor registers a global atexit hook
-    (concurrent.futures.thread._python_exit) that joins every one of its
-    worker threads before the Python process is allowed to fully exit. If a
-    worker is stuck forever on a genuinely wedged I2C read, that hook can
-    block the *entire process* from exiting - meaning sys.exit(), Ctrl+C,
-    or `systemctl restart button-printer.service` could all hang
-    indefinitely waiting for a read that's never coming back, instead of
-    the script just... failing safe and continuing, which was the entire
-    point of this timeout in the first place. A plain daemon thread has no
-    such hook - it's simply abandoned at process exit, so a stuck read can
-    never prevent the script itself from stopping cleanly.
+    Why this exists: the two previous versions of this fix (per-attempt
+    disposable threads, then a per-channel `_InFlightRead` running on its
+    own thread) both bounded *how many* threads could pile up, but neither
+    one stopped the button-channel read and the pot-channel read from
+    actually hitting the I2C bus *at the same time*, from two different
+    threads, since each channel got its own independent thread. The
+    adafruit_ads1x15 driver was never written to be thread-safe - a single
+    "read voltage" call is actually a short sequence of I2C transactions
+    (write a config register, then read back the conversion result), and if
+    two threads' sequences interleave mid-transaction, the bus can end up
+    in a corrupted state where the underlying smbus call never returns -
+    which looks exactly like a wedged/dead bus, but is actually self-
+    inflicted by concurrent access, not a wiring/electrical fault. This is
+    almost certainly why i2c_diag.py (deliberately single-threaded, one
+    channel at a time, no concurrency at all) can run cleanly with zero
+    errors while the real multi-threaded script still hangs occasionally -
+    and why the hangs got worse as POT_LED_UPDATE_INTERVAL_SECONDS got
+    turned down further, since a faster pot-polling loop means more
+    opportunities for its reads to land at the same instant as the button
+    loop's.
+
+    The fix: route every read through this one worker thread, which
+    processes requests strictly one at a time from a queue, so only one
+    real I2C transaction is ever in flight on the bus, regardless of which
+    channel or which calling thread asked for it. It's a single persistent
+    thread (not one per attempt or one per channel) - created once, for the
+    life of the process, so there's no way for it to leak: worst case is
+    exactly one thread, forever, whether the bus is perfectly healthy or
+    permanently stuck. And because it's a daemon thread, a request the
+    worker is stuck on forever still can't block the process from exiting
+    (see the ThreadPoolExecutor pitfall noted in read_voltage()'s history in
+    README.md - a plain daemon thread has none of that atexit-joining
+    behavior).
     """
 
-    def __init__(self, target):
-        self._done = threading.Event()
-        self._value = None
-        self._error = None
-        self._thread = threading.Thread(target=self._run, args=(target,), daemon=True)
+    def __init__(self):
+        self._queue = queue.Queue()
+        self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def _run(self, target):
-        try:
-            self._value = target()
-        except Exception as exc:  # noqa: BLE001 - re-raised as-is by result() below
-            self._error = exc
-        finally:
-            self._done.set()
+    def _run(self):
+        while True:
+            channel, holder = self._queue.get()
+            try:
+                holder["value"] = channel.voltage
+            except Exception as exc:  # noqa: BLE001 - re-raised as-is by the waiting caller
+                holder["error"] = exc
+            finally:
+                holder["event"].set()
 
-    def done(self):
-        return self._done.is_set()
-
-    def result(self, timeout):
-        if not self._done.wait(timeout):
-            raise TimeoutError()
-        if self._error is not None:
-            raise self._error
-        return self._value
+    def submit(self, channel, holder):
+        self._queue.put((channel, holder))
 
 
-# At most one outstanding (started-but-not-yet-known-to-be-done) read per
-# channel - id(channel) -> _InFlightRead. If a channel's read is already in
-# flight when another call comes in for the *same* channel, that call joins
-# the existing one instead of starting a duplicate thread. This is what
-# actually bounds resource use: no matter how many times read_voltage()
-# retries, or how fast pot_monitor_loop() polls, there is never more than
-# one real read outstanding per channel (2 total, for button + pot) -
-# retries just wait longer on the same one, rather than starting new ones.
-#
-# The first version of this fix spawned a brand-new disposable thread on
-# every single attempt and just abandoned it on timeout. That's fine
-# against a fault that resolves quickly, but it doesn't bound anything
-# against a *sustained* fault (bus fully dead, or just consistently a bit
-# slower than the timeout): every retry, every poll tick, spawned another
-# thread that either never returned or returned too late to matter - and
-# pot_monitor_loop() polls every POT_LED_UPDATE_INTERVAL_SECONDS forever,
-# so those piled up faster than a slow-but-not-dead bus could drain them.
-# That's an unbounded leak, not a bounded one - it made things worse
-# exactly in proportion to how fast the poll loop got sped up, since a
-# faster loop means faster leaking.
+_i2c_worker = _I2CWorker()
+
+# At most one outstanding (queued-or-running) read per channel -
+# id(channel) -> holder dict. If a channel's read is already queued/running
+# when another call comes in for the *same* channel, that call just waits on
+# the same holder instead of submitting a duplicate request - this is what
+# keeps the worker's queue from growing without bound under a sustained
+# fault, no matter how fast read_voltage() retries or pot_monitor_loop()
+# polls.
 _i2c_inflight = {}
 _i2c_inflight_lock = threading.Lock()
 
 
 def _read_channel_voltage_with_timeout(channel, timeout):
-    """Read channel.voltage with a hard wall-clock timeout, without letting
-    a wedged or merely slow I2C bus accumulate unbounded background threads
-    or block the process from exiting (see _InFlightRead/_i2c_inflight
-    above for why both of those matter and what went wrong with the
-    earlier versions of this fix).
+    """Read channel.voltage with a hard wall-clock timeout, via the single
+    shared _i2c_worker (see _I2CWorker's docstring for why routing every
+    read through one worker thread - rather than letting each channel's
+    read run on its own thread - is the actual fix, not just a timeout).
 
     A loose wire or I2C noise raises OSError promptly, which the retry loop
     in read_voltage() already handled - but a genuinely wedged I2C bus
-    (electrical fault holding SDA/SCL, a stuck device) can make the
+    (electrical fault holding SDA/SCL, a stuck device, OR two threads'
+    transactions having corrupted each other - see _I2CWorker) can make the
     underlying smbus call block far longer than expected, or forever,
     instead of raising anything. Without a timeout at all, is_button_pressed()
     (main thread) and read_pot_fraction() (pot_monitor_loop's thread) would
-    both hang on their next I2C read to the same physically-stuck
-    ADS1015/bus - freezing button handling and LED updates at the same
-    time, with no exception for anything to catch and no crash for
-    systemd's Restart=on-failure to act on. The two dashboards keep running
-    fine throughout any of this (they never touch I2C), just showing
-    status.json exactly as it was the instant the main process froze -
-    which is why they show no error.
+    both hang on their next I2C read - freezing button handling and LED
+    updates at the same time, with no exception for anything to catch and
+    no crash for systemd's Restart=on-failure to act on. The two dashboards
+    keep running fine throughout any of this (they never touch I2C), just
+    showing status.json exactly as it was the instant the main process
+    froze - which is why they show no error.
     """
     with _i2c_inflight_lock:
-        inflight = _i2c_inflight.get(id(channel))
-        if inflight is None or inflight.done():
-            inflight = _InFlightRead(lambda: channel.voltage)
-            _i2c_inflight[id(channel)] = inflight
+        holder = _i2c_inflight.get(id(channel))
+        if holder is None or holder["event"].is_set():
+            holder = {"event": threading.Event(), "value": None, "error": None}
+            _i2c_inflight[id(channel)] = holder
+            _i2c_worker.submit(channel, holder)
 
-    try:
-        return inflight.result(timeout=timeout)
-    except TimeoutError:
-        raise OSError(f"I2C read timed out after {timeout}s (bus may be stuck)")
+    if not holder["event"].wait(timeout):
+        raise OSError(f"I2C read timed out after {timeout}s (bus busy/stuck)")
+    if holder["error"] is not None:
+        raise holder["error"]
+    return holder["value"]
 
 
 def read_voltage(channel, retries=ADC_READ_RETRIES, retry_delay=ADC_READ_RETRY_DELAY,

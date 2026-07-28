@@ -22,6 +22,9 @@ do that first. This README covers how to run each script.
 | `config_io.py` | Shared settings-file helper (LED colors/timing, pot dim-in range, audio levels) | No |
 | `status_display.py` | Full-screen status dashboard, meant for the Pi's HDMI console | Yes |
 | `status_web.py` | LAN-accessible status page with test-print/restart/settings controls | Yes |
+| `reload_services.sh` | Restarts the three systemd services after a code change | Yes |
+| `stop_services.sh` | Stops the three systemd services, to test by hand without contention | Yes |
+| `i2c_diag.py` | Standalone pot/button reader for diagnosing I2C bus issues | Yes |
 
 ---
 
@@ -87,7 +90,7 @@ to I2C problems now, covering two different failure modes:
   the same time. If the bus recovers, subsequent reads pick back up
   automatically - no restart needed.
 
-  Getting this right took two attempts, both worth knowing about if you're
+  Getting this right took three attempts, all worth knowing about if you're
   touching this code:
   1. The first version ran every single retry attempt in a brand-new
      disposable thread and just abandoned it on timeout. That bounds any
@@ -103,17 +106,60 @@ to I2C problems now, covering two different failure modes:
      allowed to fully exit. A worker stuck forever on a truly dead I2C read
      would then block `sys.exit()`, Ctrl+C, and `systemctl restart
      button-printer.service` from ever completing - the opposite of what a
-     timeout is supposed to buy you.
+     timeout is supposed to buy you. The fix for *that* was a hand-rolled
+     `_InFlightRead` (`threading.Event` + a plain
+     `threading.Thread(daemon=True)`), with at most one outstanding read
+     tracked *per channel* (`id(channel)` in a dict) - retries on the same
+     channel reused the one in-flight read instead of starting new ones, so
+     a sustained fault was bounded at exactly one leaked thread per channel
+     (two total, for button + pot), and daemon threads can't block process
+     exit either way.
+  3. That per-channel version still hung occasionally, and - the key clue -
+     `i2c_diag.py` (see below) could run for a long time with **zero**
+     errors while the real script still froze. i2c_diag.py is deliberately
+     single-threaded, reading one channel at a time; the real script has
+     the button-polling loop (main thread, polling continuously via
+     `wait_for_stable_state()`) and `pot_monitor_loop()` (its own thread)
+     both hitting the *same* ADS1015 constantly, on two different threads,
+     with nothing coordinating between them. The adafruit_ads1x15 driver was
+     never written to be thread-safe - a "read voltage" call is actually a
+     short sequence of I2C transactions (write a config register, then read
+     the conversion result), and if the button thread's sequence and the
+     pot thread's sequence interleave mid-transaction, the bus can end up
+     in a corrupted state where the underlying smbus call never returns -
+     which looks exactly like a wedged bus, but is self-inflicted by
+     concurrent access, not a wiring fault. This lined up with everything
+     observed: no errors from a single-threaded diagnostic, hangs from the
+     real (multi-threaded) script, and the hangs getting *worse* as
+     `POT_LED_UPDATE_INTERVAL_SECONDS` got turned down - a faster pot loop
+     means more chances for its reads to land at the same instant as the
+     button loop's.
 
-  What's actually in the code now: a small hand-rolled `_InFlightRead`
-  (`threading.Event` + a plain `threading.Thread(daemon=True)`), with at
-  most one outstanding read tracked per ADC channel (`_i2c_inflight`, keyed
-  by `id(channel)`). Retries on the *same* channel reuse that one
-  in-flight read instead of starting new ones, so a sustained fault is
-  bounded at exactly one leaked thread per channel (two total, for
-  button + pot) no matter how long it lasts or how many times callers
-  retry - and because they're plain daemon threads, not pool workers, none
-  of that can ever block the process from exiting.
+  What's actually in the code now: a single, permanent, daemon
+  `_I2CWorker` thread that owns *all* I2C access - both channels' reads go
+  through it via a queue, processed strictly one at a time, so only one
+  real transaction is ever on the bus regardless of which channel or thread
+  asked for it. That's the actual fix for the interleaving bug (nothing
+  about timeouts alone could have fixed it - the earlier versions just
+  bounded the *symptom*). It's also simpler and safer than the two
+  per-channel versions before it: exactly one thread exists for the entire
+  life of the process, not "up to one per channel" - there's no way for it
+  to leak further no matter how long a fault lasts or how many times
+  callers retry, and the per-channel `_i2c_inflight` dict still dedupes
+  repeated calls so the worker's queue never grows past one pending item
+  per channel.
+
+  One real trade-off worth knowing: because there's now a single shared
+  worker, if a read on *either* channel ever gets permanently and totally
+  stuck, reads on *both* channels start timing out (not hanging - each
+  still fails safely within its own timeout - just no longer independent).
+  The previous per-channel design didn't have that coupling, but it also
+  wasn't actually protecting anything in a genuine bus-level wedge - a real
+  electrical fault affects every device on the bus regardless of which
+  software thread is asking, so both channels' independent threads would
+  have hung right along with each other anyway. The coupling only shows up
+  in exchange for actually fixing the far more likely cause (the
+  concurrent-access race above), so it's a good trade.
 
 The dashboards themselves can't cause either of these - they're separate
 processes that only ever read/write the shared `status.json`/`config.json`
@@ -451,6 +497,54 @@ Needs root (same as the services themselves) — it re-execs itself with
 `sudo` automatically if you don't run it with sudo already. Skips any
 service that isn't installed yet on that particular Pi rather than failing,
 and prints an active/not-active summary at the end.
+
+## `stop_services.sh`
+
+Stops the same three services (doesn't disable them — they come back on
+the next reboot or `./reload_services.sh`), so you can run something like
+`i2c_diag.py` by hand without the real services also holding the I2C
+bus/GPIO/NeoPixel strip in the background and contending with it.
+
+```bash
+./stop_services.sh              # stop all three
+./stop_services.sh web          # just status-web.service
+```
+
+Same sudo/re-exec/skip-if-not-installed behavior as `reload_services.sh`.
+
+## `i2c_diag.py`
+
+Standalone pot/button reader for diagnosing I2C bus issues — deliberately
+doesn't import `config_io.py`, `status_io.py`, or `button_neopixel_printer.py`,
+only the same underlying hardware libraries (`board`/`busio`/
+`adafruit_ads1x15`) those modules use, so it can't be affected by any bug in
+our own code and can run independently of (or instead of) the real services.
+
+```bash
+sudo ./stop_services.sh     # free up the bus first
+python3 i2c_diag.py
+python3 i2c_diag.py --interval 0.05
+```
+
+Reads both ADC channels in a loop, one at a time, printing each voltage/raw
+value with a timestamp and a running count of any I2C errors
+(`OSError` from the underlying smbus call) as they happen. Deliberately has
+**no** retry/timeout logic, unlike `read_voltage()` in the main script — the
+goal is to observe the bus's raw behavior, not paper over it. If a read
+hangs, this script hangs too, and whichever line printed last (`reading
+pot...` / `reading button...`) tells you exactly which channel froze.
+
+**Why this mattered for the I2C hang investigation:** this script running
+clean with zero errors while the real script still froze occasionally was
+the key clue that the problem *wasn't* a flaky physical bus after all — see
+the three-attempt history under `button_neopixel_printer.py`'s I2C section
+above. i2c_diag.py is single-threaded (reads one channel at a time); the
+real script has two threads (button polling + `pot_monitor_loop()`) hitting
+the same ADS1015 concurrently, which is what was actually causing the
+occasional hangs — a software race, not a wiring fault. If you ever need to
+confirm a *genuine* electrical fault again in the future (loose wire, bad
+pull-ups, etc.) rather than a software race, this script is still the right
+tool - it just wasn't what explained this particular round of hangs.
 
 ## Dependencies
 
