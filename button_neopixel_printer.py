@@ -167,7 +167,7 @@ ADC_READ_RETRY_DELAY = 0.05  # seconds between retries
 # no longer multiplies how often write_status() gets called (write_status()
 # is thread-safe either way now - see status_io.py - but there's no reason
 # to hammer the disk just because the LED update rate went up).
-POT_LED_UPDATE_INTERVAL_SECONDS = 0.05
+POT_LED_UPDATE_INTERVAL_SECONDS = 0.02
 POT_STATUS_WRITE_INTERVAL_SECONDS = 0.5
 POT_CONFIG_RELOAD_INTERVAL_SECONDS = 0.5
 
