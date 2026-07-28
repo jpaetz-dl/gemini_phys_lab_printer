@@ -78,14 +78,42 @@ to I2C problems now, covering two different failure modes:
 - **A genuinely wedged bus** (an electrical fault holding SDA/SCL, a stuck
   device) - this doesn't raise anything, it makes the underlying smbus call
   block *forever*, which no amount of retrying-on-exception can catch since
-  nothing ever returns or raises. `read_voltage()` now runs each attempt in
-  a disposable thread with a hard timeout (`ADC_READ_TIMEOUT_SECONDS`,
-  0.2s) instead of calling `channel.voltage` directly, so a truly stuck bus
-  now fails the same way a quick glitch does (bounded, logged, safe) instead
-  of freezing the button-polling loop and the pot-monitor thread forever -
-  both of which share the same I2C bus, so a wedge affects both LEDs and the
-  button at the same time. If the bus recovers, subsequent reads pick back
-  up automatically - no restart needed.
+  nothing ever returns or raises. `read_voltage()` now bounds each attempt
+  with a hard timeout (`ADC_READ_TIMEOUT_SECONDS`, 0.2s) instead of calling
+  `channel.voltage` directly, so a truly stuck bus now fails the same way a
+  quick glitch does (bounded, logged, safe) instead of freezing the
+  button-polling loop and the pot-monitor thread forever - both of which
+  share the same I2C bus, so a wedge affects both LEDs and the button at
+  the same time. If the bus recovers, subsequent reads pick back up
+  automatically - no restart needed.
+
+  Getting this right took two attempts, both worth knowing about if you're
+  touching this code:
+  1. The first version ran every single retry attempt in a brand-new
+     disposable thread and just abandoned it on timeout. That bounds any
+     *one* read, but not a *sustained* fault: pot_monitor_loop() polls
+     forever, so a bus that stays bad (or is just consistently a bit slower
+     than the timeout) piled up new threads faster than a stuck-but-not-dead
+     bus could drain them - an unbounded leak that got worse the faster the
+     poll loop ran, which is exactly backwards from the goal.
+  2. The fix for that used `concurrent.futures.ThreadPoolExecutor` with a
+     small fixed worker count - bounded thread count, but it introduced a
+     *different* serious bug: `ThreadPoolExecutor` registers a global
+     `atexit` hook that joins every worker thread before the process is
+     allowed to fully exit. A worker stuck forever on a truly dead I2C read
+     would then block `sys.exit()`, Ctrl+C, and `systemctl restart
+     button-printer.service` from ever completing - the opposite of what a
+     timeout is supposed to buy you.
+
+  What's actually in the code now: a small hand-rolled `_InFlightRead`
+  (`threading.Event` + a plain `threading.Thread(daemon=True)`), with at
+  most one outstanding read tracked per ADC channel (`_i2c_inflight`, keyed
+  by `id(channel)`). Retries on the *same* channel reuse that one
+  in-flight read instead of starting new ones, so a sustained fault is
+  bounded at exactly one leaked thread per channel (two total, for
+  button + pot) no matter how long it lasts or how many times callers
+  retry - and because they're plain daemon threads, not pool workers, none
+  of that can ever block the process from exiting.
 
 The dashboards themselves can't cause either of these - they're separate
 processes that only ever read/write the shared `status.json`/`config.json`

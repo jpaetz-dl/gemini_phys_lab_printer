@@ -273,48 +273,106 @@ _chase_thread = None
 _chase_stop_event = None
 
 
+class _InFlightRead:
+    """A minimal, manually-implemented stand-in for a concurrent.futures
+    Future, backed by a single plain `threading.Thread(daemon=True)`.
+
+    This is deliberately NOT concurrent.futures.ThreadPoolExecutor. That
+    was the second version of this fix, and it introduced a *worse* bug:
+    ThreadPoolExecutor registers a global atexit hook
+    (concurrent.futures.thread._python_exit) that joins every one of its
+    worker threads before the Python process is allowed to fully exit. If a
+    worker is stuck forever on a genuinely wedged I2C read, that hook can
+    block the *entire process* from exiting - meaning sys.exit(), Ctrl+C,
+    or `systemctl restart button-printer.service` could all hang
+    indefinitely waiting for a read that's never coming back, instead of
+    the script just... failing safe and continuing, which was the entire
+    point of this timeout in the first place. A plain daemon thread has no
+    such hook - it's simply abandoned at process exit, so a stuck read can
+    never prevent the script itself from stopping cleanly.
+    """
+
+    def __init__(self, target):
+        self._done = threading.Event()
+        self._value = None
+        self._error = None
+        self._thread = threading.Thread(target=self._run, args=(target,), daemon=True)
+        self._thread.start()
+
+    def _run(self, target):
+        try:
+            self._value = target()
+        except Exception as exc:  # noqa: BLE001 - re-raised as-is by result() below
+            self._error = exc
+        finally:
+            self._done.set()
+
+    def done(self):
+        return self._done.is_set()
+
+    def result(self, timeout):
+        if not self._done.wait(timeout):
+            raise TimeoutError()
+        if self._error is not None:
+            raise self._error
+        return self._value
+
+
+# At most one outstanding (started-but-not-yet-known-to-be-done) read per
+# channel - id(channel) -> _InFlightRead. If a channel's read is already in
+# flight when another call comes in for the *same* channel, that call joins
+# the existing one instead of starting a duplicate thread. This is what
+# actually bounds resource use: no matter how many times read_voltage()
+# retries, or how fast pot_monitor_loop() polls, there is never more than
+# one real read outstanding per channel (2 total, for button + pot) -
+# retries just wait longer on the same one, rather than starting new ones.
+#
+# The first version of this fix spawned a brand-new disposable thread on
+# every single attempt and just abandoned it on timeout. That's fine
+# against a fault that resolves quickly, but it doesn't bound anything
+# against a *sustained* fault (bus fully dead, or just consistently a bit
+# slower than the timeout): every retry, every poll tick, spawned another
+# thread that either never returned or returned too late to matter - and
+# pot_monitor_loop() polls every POT_LED_UPDATE_INTERVAL_SECONDS forever,
+# so those piled up faster than a slow-but-not-dead bus could drain them.
+# That's an unbounded leak, not a bounded one - it made things worse
+# exactly in proportion to how fast the poll loop got sped up, since a
+# faster loop means faster leaking.
+_i2c_inflight = {}
+_i2c_inflight_lock = threading.Lock()
+
+
 def _read_channel_voltage_with_timeout(channel, timeout):
-    """Read channel.voltage with a hard wall-clock timeout, by running the
-    read in a fresh, disposable daemon thread rather than the calling
-    thread.
+    """Read channel.voltage with a hard wall-clock timeout, without letting
+    a wedged or merely slow I2C bus accumulate unbounded background threads
+    or block the process from exiting (see _InFlightRead/_i2c_inflight
+    above for why both of those matter and what went wrong with the
+    earlier versions of this fix).
 
     A loose wire or I2C noise raises OSError promptly, which the retry loop
     in read_voltage() already handled - but a genuinely wedged I2C bus
     (electrical fault holding SDA/SCL, a stuck device) can make the
-    underlying smbus call block *forever* instead of raising anything. That
-    happened: with no timeout, is_button_pressed() (main thread) and
-    read_pot_fraction() (pot_monitor_loop's thread) both hung on their next
-    I2C read to the same physically-stuck ADS1015/bus - freezing button
-    handling and LED updates at the same time, with no exception for
-    anything to catch and no crash for systemd's Restart=on-failure to act
-    on. The two dashboards kept running fine throughout (they never touch
-    I2C), just showing status.json exactly as it was the instant the main
-    process froze - which is why they showed no error.
-
-    Running the read in a throwaway thread and join()-ing it with a timeout
-    is the only way to bound that: if the thread doesn't finish in time, we
-    give up and move on. The abandoned thread may itself stay blocked
-    forever if the bus never recovers (Python can't force-cancel a thread
-    stuck in a C-level call) - that's an acceptable trade for a slowly
-    leaking daemon thread over freezing the entire script. If the bus does
-    recover, subsequent reads work normally again with no restart needed.
+    underlying smbus call block far longer than expected, or forever,
+    instead of raising anything. Without a timeout at all, is_button_pressed()
+    (main thread) and read_pot_fraction() (pot_monitor_loop's thread) would
+    both hang on their next I2C read to the same physically-stuck
+    ADS1015/bus - freezing button handling and LED updates at the same
+    time, with no exception for anything to catch and no crash for
+    systemd's Restart=on-failure to act on. The two dashboards keep running
+    fine throughout any of this (they never touch I2C), just showing
+    status.json exactly as it was the instant the main process froze -
+    which is why they show no error.
     """
-    result = {}
+    with _i2c_inflight_lock:
+        inflight = _i2c_inflight.get(id(channel))
+        if inflight is None or inflight.done():
+            inflight = _InFlightRead(lambda: channel.voltage)
+            _i2c_inflight[id(channel)] = inflight
 
-    def _read():
-        try:
-            result["value"] = channel.voltage
-        except Exception as exc:  # noqa: BLE001 - re-raised as-is on the caller's side below
-            result["error"] = exc
-
-    thread = threading.Thread(target=_read, daemon=True)
-    thread.start()
-    thread.join(timeout)
-    if thread.is_alive():
+    try:
+        return inflight.result(timeout=timeout)
+    except TimeoutError:
         raise OSError(f"I2C read timed out after {timeout}s (bus may be stuck)")
-    if "error" in result:
-        raise result["error"]
-    return result["value"]
 
 
 def read_voltage(channel, retries=ADC_READ_RETRIES, retry_delay=ADC_READ_RETRY_DELAY,
